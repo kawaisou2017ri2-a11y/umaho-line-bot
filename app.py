@@ -22,8 +22,8 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 def generate_ai_response(prompt):
-    """Gemini API呼び出し（モデルの自動切替・フォールバック機能付き）"""
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+    """現在サポートされている最新モデル（gemini-1.5-flash / gemini-1.5-pro）で呼び出し"""
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
     last_error = None
     for model_name in models_to_try:
         try:
@@ -67,7 +67,6 @@ def process_async_prediction(user_text, reply_token, user_id):
         )
 
     except Exception as e:
-        # エラー詳細を直接LINEに送信して原因を完全特定する
         error_msg = f"⚠️ エラーが発生しました。\n\n【詳細原因】\n{str(e)}"
         try:
             line_bot_api.push_message(
