@@ -59,10 +59,15 @@ def process_async_prediction(user_text, reply_token, user_id):
             TextSendMessage(text=f"【受付完了】\n「{user_text}」の分析処理を開始しました！\n予想の生成完了まで数秒お待ちください... 🏇")
         )
 
-        # 2. Geminiでの予想生成（文字数制限の指示を追加）
+        # 2. Geminiでの予想生成（日本語出力を強力に強制）
         prompt = f"""
-あなたはウマホの分析ロジックに熟知したプロの競馬予想AIです。
-以下の依頼内容に基づき、説得力のある競馬予想を作成してください。
+【最重要指示】
+思考プロセス、考察、出力メッセージを含め、すべての文章を**必ず完全な「日本語のみ」**で作成してください。英語は1文字も出力・思考ログに出さないでください。
+
+---
+
+あなたはウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／優先度に基づく条件緩和／期待値算出）に熟知したプロの競馬予想AIです。
+以下の依頼内容に基づき、説得力のある競馬予想をすべて日本語で作成してください。
 
 【依頼内容】
 {user_text}
@@ -72,11 +77,11 @@ def process_async_prediction(user_text, reply_token, user_id):
 2. 予想の根拠と解説（ウマホの期待値視点）
 3. おすすめの買い目
 
-※注意：LINEの送信制限があるため、全体で【1,500字〜2,000字程度】で読みやすく整理して出力してください。
+※注意：LINEの送信制限があるため、全体で【1,500字〜2,000字程度】で読みやすく整理して日本語で出力してください。
 """
         response_text = generate_ai_response(prompt)
 
-        # LINEの5,000文字上限を超えないよう安全にカット（トリミング）
+        # LINEの5,000文字上限を超えないよう安全にカット
         if len(response_text) > 4500:
             response_text = response_text[:4500] + "\n\n...(文字数制限のため一部省略)"
 
@@ -88,7 +93,6 @@ def process_async_prediction(user_text, reply_token, user_id):
 
     except Exception as e:
         error_msg = f"⚠️ エラーが発生しました。\n\n【詳細原因】\n{str(e)}"
-        # エラーメッセージ自体も文字数制限に引っかからないようトリミング
         if len(error_msg) > 4000:
             error_msg = error_msg[:4000]
             
