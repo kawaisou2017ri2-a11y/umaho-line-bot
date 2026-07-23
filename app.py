@@ -68,7 +68,6 @@ def parse_netkeiba(url):
         res.encoding = res.apparent_encoding if res.apparent_encoding else 'utf-8'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # レース情報の取得
         race_title = ""
         title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum')
         if title_elem:
@@ -79,10 +78,8 @@ def parse_netkeiba(url):
         if data_elem:
             race_data = data_elem.text.strip()
 
-        # 出走馬一覧のスクレイピング
         horses = []
         rows = soup.select('tr.HorseList, tr.HorseInfo, table.Shutuba_Table tr, .HorseListTr, tr[class*="Horse"]')
-        
         if not rows:
             rows = soup.select('.Shutuba_Table tr, table tr')
 
@@ -103,7 +100,6 @@ def parse_netkeiba(url):
                     jockey = jockey_elem.text.strip() if jockey_elem else "不明"
                     sire = sire_elem.text.strip() if sire_elem else ""
 
-                    # 情報不足時のバックアップ検索発動
                     if not sire or sire == "不明" or len(sire) < 2:
                         sire = backup_horse_search(bamei)
 
@@ -114,13 +110,13 @@ def parse_netkeiba(url):
         return None, []
 
 def generate_ai_response(prompt):
-    """数値・スコア出力に特化したGemini呼び出し関数"""
+    """思考ログ・英語・買い目を一切出力させず表のみ生成させる関数"""
     system_instruction = (
         "あなたは競馬のウマホ期待値計算AIです。"
         "【絶対ルール】"
-        "1. 長文の解説、挨拶、根拠の説明は一切出力禁止です。"
-        "2. 1文字目から全出走馬の【ウマホ期待値スコア表（期待値の高い順）】を出力してください。"
-        "3. 表の後にシンプルなおすすめ買い目（2〜3行）のみを記載して終了してください。"
+        "1. 英語の思考プロセスや下書き、メモ、挨拶、文章による解説は絶対に出力しないでください。"
+        "2. 「買い目」の推奨やアドバイスは一切禁止です。絶対に記載しないでください。"
+        "3. 1文字目から「🏆 **ウマホ全馬期待値スコア**」で始め、スコア一覧表のみを日本語で出力してください。"
     )
     
     models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
@@ -154,7 +150,7 @@ def process_async_prediction(user_text, reply_token, user_id):
         if url and 'netkeiba' in url:
             line_bot_api.reply_message(
                 reply_token,
-                TextSendMessage(text="【受付完了】\nNetkeibaの出走表データを取得中...（バックアップ検索機能稼働中）🏇")
+                TextSendMessage(text="【受付完了】\nNetkeibaの出走表データを解析中... 🏇")
             )
             
             race_info, horses = parse_netkeiba(url)
@@ -162,7 +158,7 @@ def process_async_prediction(user_text, reply_token, user_id):
             if horses:
                 horses_str = "\n".join(horses)
                 prompt = f"""
-以下のNetkeibaデータに基づき、ウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／条件緩和／期待値算出）を適用した【全馬の期待値スコア】を出力してください。
+以下のNetkeibaデータに基づき、ウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／条件緩和／期待値算出）を適用した【全馬の期待値スコア表】を完全な日本語で作成してください。
 
 【レース情報】
 {race_info}
@@ -170,7 +166,10 @@ def process_async_prediction(user_text, reply_token, user_id):
 【出走馬データ】
 {horses_str}
 
-【出力フォーマット】
+【最重要指示】
+・買い目の記載は一切不要です。絶対に書かないでください。
+・1文字目から以下の表形式のみを出力してください。
+
 🏆 **ウマホ全馬期待値スコア**
 
 | 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | ウマホ期待値 | 評価 |
@@ -178,19 +177,15 @@ def process_async_prediction(user_text, reply_token, user_id):
 | ◎ | X | 馬名 | 牡X | 種牡馬 | 88 / 100 | S |
 | ○ | X | 馬名 | 牝X | 種牡馬 | 79 / 100 | A |
 ...
-
-💡 **買い目目安**
-・馬連/ワイド：◎ - ○, ▲, △
-・3連複：◎ - ○, ▲ - ○, ▲, △, ☆
 """
             else:
-                prompt = f"URLからの情報取得に一部制限があったため、以下の入力から全馬の期待値スコア表を作成してください:\n{user_text}"
+                prompt = f"以下の入力データから買い目を除外した【全馬のウマホ期待値スコア表】のみを日本語で作成してください:\n{user_text}"
         else:
             line_bot_api.reply_message(
                 reply_token,
-                TextSendMessage(text="【受付完了】\nデータ分析中... 期待値スコアを計算中です 🏇")
+                TextSendMessage(text="【受付完了】\n期待値スコアを計算中です... 🏇")
             )
-            prompt = f"以下のテキストから全馬のウマホ期待値スコア表を作成してください:\n{user_text}"
+            prompt = f"以下のテキストから買い目を除外した【全馬のウマホ期待値スコア表】のみを日本語で作成してください:\n{user_text}"
 
         response_text = generate_ai_response(prompt)
 
