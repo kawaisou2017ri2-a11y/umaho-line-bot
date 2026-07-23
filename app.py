@@ -32,6 +32,18 @@ def extract_url(text):
     match = re.search(r'https?://[^\s]+', text)
     return match.group(0) if match else None
 
+def extract_track_condition(text):
+    """ユーザー指定の馬場状態（良・稍重・重・不良）を抽出"""
+    if '不良' in text:
+        return '不良'
+    elif '稍重' in text:
+        return '稍重'
+    elif '重' in text:
+        return '重'
+    elif '良' in text:
+        return '良'
+    return None
+
 def backup_horse_search(horse_name):
     """【バックアップ機能】出走表で種牡馬（父）が不明な場合、Netkeiba DBを検索して取得"""
     try:
@@ -109,14 +121,34 @@ def parse_netkeiba(url):
     except Exception as e:
         return None, []
 
+def clean_japanese_output(text):
+    """英語思考ログや余計な文を強力除去し、純粋な表データのみ抽出"""
+    if not text:
+        return ""
+    
+    # 🏆マーク以降を抽出
+    if "🏆" in text:
+        text = text[text.find("🏆"):]
+    elif "|" in text:
+        text = text[text.find("|"):]
+
+    # 日本語・表以外の行（英語のみの行など）を除外
+    lines = text.splitlines()
+    cleaned_lines = []
+    for line in lines:
+        if '|' in line or '🏆' in line or re.search(r'[\u3040-\u30ff\u4e00-\u9faf]', line):
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
 def generate_ai_response(prompt):
-    """エラーを劇的に防ぐ安全設計のGemini呼び出し関数"""
+    """Gemini応答生成関数"""
     system_instruction = (
         "あなたは競馬のウマホ期待値計算AIです。\n"
-        "【絶対厳守ルール】\n"
-        "1. 英語、思考プロセス、メモ、解説、挨拶は一切出力しないでください。\n"
-        "2. 「買い目」や「おすすめの買い方」は絶対に書かないでください。\n"
-        "3. 1文字目から必ず「🏆 **ウマホ全馬期待値スコア**」で開始し、表のみを出力してください。"
+        "【最重要ルール】\n"
+        "1. 思考プロセス、英語の文言、メモは一切出力禁止。\n"
+        "2. 買い目、おすすめの買い方は絶対に出力しないこと。\n"
+        "3. 1文字目から必ず「🏆 **ウマホ全馬期待値スコア**」で始め、表形式のみを出力すること。"
     )
     
     models_to_try = [
@@ -131,77 +163,59 @@ def generate_ai_response(prompt):
 
     for model_name in models_to_try:
         try:
-            try:
-                m = genai.GenerativeModel(model_name, system_instruction=system_instruction)
-            except Exception:
-                m = genai.GenerativeModel(model_name)
-
+            m = genai.GenerativeModel(model_name, system_instruction=system_instruction)
             res = m.generate_content(prompt)
             
-            # テキストの安全抽出処理
-            text = None
+            raw_text = None
             if hasattr(res, 'candidates') and res.candidates:
                 for candidate in res.candidates:
                     if candidate.content and candidate.content.parts:
                         parts_text = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text')])
                         if parts_text:
-                            text = parts_text
+                            raw_text = parts_text
                             break
 
-            if not text and hasattr(res, 'text'):
+            if not raw_text and hasattr(res, 'text'):
                 try:
-                    text = res.text
+                    raw_text = res.text
                 except Exception:
                     pass
 
-            if text:
-                if "🏆" in text:
-                    text = text[text.find("🏆"):]
-                return text
+            if raw_text:
+                cleaned = clean_japanese_output(raw_text)
+                if cleaned:
+                    return cleaned
         except Exception as e:
             last_err = e
             continue
 
-    # 動的モデル取得によるバックアップ
-    try:
-        for m_info in genai.list_models():
-            if 'generateContent' in m_info.supported_generation_methods:
-                try:
-                    m = genai.GenerativeModel(m_info.name, system_instruction=system_instruction)
-                    res = m.generate_content(prompt)
-                    if hasattr(res, 'candidates') and res.candidates:
-                        for candidate in res.candidates:
-                            if candidate.content and candidate.content.parts:
-                                parts_text = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text')])
-                                if parts_text:
-                                    if "🏆" in parts_text:
-                                        parts_text = parts_text[parts_text.find("🏆"):]
-                                    return parts_text
-                except Exception as inner_e:
-                    last_err = inner_e
-                    continue
-    except Exception as list_err:
-        last_err = list_err
-
-    raise Exception(f"AI処理エラー詳細: {str(last_err)}")
+    raise Exception(f"AI処理エラー: {str(last_err)}")
 
 def process_async_prediction(user_text, reply_token, user_id):
-    """バックグラウンドで処理を行うメイン関数"""
+    """バックグラウンド処理メイン関数"""
     try:
         url = extract_url(user_text)
+        specified_condition = extract_track_condition(user_text)
         
+        condition_msg = f"（指定馬場条件: 【{specified_condition}】を適用）" if specified_condition else ""
+
         if url and 'netkeiba' in url:
             line_bot_api.reply_message(
                 reply_token,
-                TextSendMessage(text="【受付完了】\n出走表データを解析中... 期待値スコアを計算しています 🏇")
+                TextSendMessage(text=f"【受付完了】\nNetkeibaデータを解析中... 期待値スコアを計算しています 🏇\n{condition_msg}")
             )
             
             race_info, horses = parse_netkeiba(url)
             
+            condition_instruction = ""
+            if specified_condition:
+                condition_instruction = f"【指定馬場条件】本レースの馬場状態は「{specified_condition}」として計算・補正を行ってください。"
+
             if horses:
                 horses_str = "\n".join(horses)
                 prompt = f"""
 以下の出走馬データに基づき、ウマホの分析ロジックを適用した全馬の期待値スコア表を作成してください。
+{condition_instruction}
 
 【レース情報】
 {race_info}
@@ -209,22 +223,20 @@ def process_async_prediction(user_text, reply_token, user_id):
 【出走馬データ】
 {horses_str}
 
-【出力指示】
-思考ログや買い目は一切入れず、以下のタイトルから始まる表のみを出力してください。
-
+【出力フォーマット】
 🏆 **ウマホ全馬期待値スコア**
 
 | 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | ウマホ期待値 | 評価 |
 |---|---|---|---|---|---|---|
 """
             else:
-                prompt = f"以下のテキストから買い目を除外した【全馬のウマホ期待値スコア表】のみを作成してください:\n{user_text}"
+                prompt = f"以下のテキストから全馬のウマホ期待値スコア表を作成してください。{condition_instruction}\n{user_text}"
         else:
             line_bot_api.reply_message(
                 reply_token,
-                TextSendMessage(text="【受付完了】\n期待値スコアを計算中です... 🏇")
+                TextSendMessage(text=f"【受付完了】\n期待値スコアを計算中です... 🏇\n{condition_msg}")
             )
-            prompt = f"以下のテキストから買い目を除外した【全馬のウマホ期待値スコア表】のみを作成してください:\n{user_text}"
+            prompt = f"以下のテキストから全馬のウマホ期待値スコア表を作成してください。{condition_msg}\n{user_text}"
 
         response_text = generate_ai_response(prompt)
 
