@@ -110,35 +110,31 @@ def parse_netkeiba(url):
         return None, []
 
 def generate_ai_response(prompt):
-    """思考ログ・英語・買い目を一切出力させず表のみ生成させる関数"""
+    """思考ログ・英語・買い目を一切排除し、スコア表のみを生成させる関数"""
     system_instruction = (
-        "あなたは競馬のウマホ期待値計算AIです。"
-        "【絶対ルール】"
-        "1. 英語の思考プロセスや下書き、メモ、挨拶、文章による解説は絶対に出力しないでください。"
-        "2. 「買い目」の推奨やアドバイスは一切禁止です。絶対に記載しないでください。"
-        "3. 1文字目から「🏆 **ウマホ全馬期待値スコア**」で始め、スコア一覧表のみを日本語で出力してください。"
+        "あなたは競馬のウマホ期待値計算AIです。\n"
+        "【絶対厳守ルール】\n"
+        "1. 英語、思考プロセス、メモ、解説、挨拶は1文字たりとも出力しないでください。\n"
+        "2. 「買い目」や「おすすめの買い方」は絶対に書かないでください。\n"
+        "3. 1文字目から必ず「🏆 **ウマホ全馬期待値スコア**」で開始し、表のみを出力してください。"
     )
     
     models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
     for preferred_model in models_to_try:
         try:
-            m = genai.GenerativeModel(preferred_model, system_instruction=system_instruction)
+            m = genai.GenerativeModel(
+                preferred_model, 
+                system_instruction=system_instruction
+            )
             res = m.generate_content(prompt)
             if res and res.text:
-                return res.text
+                # 万が一思考ログが混ざった場合のガード（タイトル以前のテキストを削る）
+                text = res.text
+                if "🏆" in text:
+                    text = text[text.find("🏆"):]
+                return text
         except Exception:
             continue
-
-    available_models = genai.list_models()
-    for m in available_models:
-        if 'generateContent' in m.supported_generation_methods:
-            try:
-                model_instance = genai.GenerativeModel(m.name, system_instruction=system_instruction)
-                res = model_instance.generate_content(prompt)
-                if res and res.text:
-                    return res.text
-            except Exception:
-                continue
 
     raise Exception("AIモデルの呼び出しに失敗しました。")
 
@@ -150,7 +146,7 @@ def process_async_prediction(user_text, reply_token, user_id):
         if url and 'netkeiba' in url:
             line_bot_api.reply_message(
                 reply_token,
-                TextSendMessage(text="【受付完了】\nNetkeibaの出走表データを解析中... 🏇")
+                TextSendMessage(text="【受付完了】\n出走表データを解析中... 期待値スコアを計算しています 🏇")
             )
             
             race_info, horses = parse_netkeiba(url)
@@ -158,7 +154,7 @@ def process_async_prediction(user_text, reply_token, user_id):
             if horses:
                 horses_str = "\n".join(horses)
                 prompt = f"""
-以下のNetkeibaデータに基づき、ウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／条件緩和／期待値算出）を適用した【全馬の期待値スコア表】を完全な日本語で作成してください。
+以下の出走馬データに基づき、ウマホの分析ロジックを適用した全馬の期待値スコア表を作成してください。
 
 【レース情報】
 {race_info}
@@ -166,26 +162,22 @@ def process_async_prediction(user_text, reply_token, user_id):
 【出走馬データ】
 {horses_str}
 
-【最重要指示】
-・買い目の記載は一切不要です。絶対に書かないでください。
-・1文字目から以下の表形式のみを出力してください。
+【出力指示】
+思考ログや買い目は一切入れず、以下のタイトルから始まる表のみを出力してください。
 
 🏆 **ウマホ全馬期待値スコア**
 
 | 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | ウマホ期待値 | 評価 |
 |---|---|---|---|---|---|---|
-| ◎ | X | 馬名 | 牡X | 種牡馬 | 88 / 100 | S |
-| ○ | X | 馬名 | 牝X | 種牡馬 | 79 / 100 | A |
-...
 """
             else:
-                prompt = f"以下の入力データから買い目を除外した【全馬のウマホ期待値スコア表】のみを日本語で作成してください:\n{user_text}"
+                prompt = f"以下のテキストから買い目を除外した【全馬のウマホ期待値スコア表】のみを作成してください:\n{user_text}"
         else:
             line_bot_api.reply_message(
                 reply_token,
                 TextSendMessage(text="【受付完了】\n期待値スコアを計算中です... 🏇")
             )
-            prompt = f"以下のテキストから買い目を除外した【全馬のウマホ期待値スコア表】のみを日本語で作成してください:\n{user_text}"
+            prompt = f"以下のテキストから買い目を除外した【全馬のウマホ期待値スコア表】のみを作成してください:\n{user_text}"
 
         response_text = generate_ai_response(prompt)
 
