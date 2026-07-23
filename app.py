@@ -110,33 +110,80 @@ def parse_netkeiba(url):
         return None, []
 
 def generate_ai_response(prompt):
-    """思考ログ・英語・買い目を一切排除し、スコア表のみを生成させる関数"""
+    """エラーを劇的に防ぐ安全設計のGemini呼び出し関数"""
     system_instruction = (
         "あなたは競馬のウマホ期待値計算AIです。\n"
         "【絶対厳守ルール】\n"
-        "1. 英語、思考プロセス、メモ、解説、挨拶は1文字たりとも出力しないでください。\n"
+        "1. 英語、思考プロセス、メモ、解説、挨拶は一切出力しないでください。\n"
         "2. 「買い目」や「おすすめの買い方」は絶対に書かないでください。\n"
         "3. 1文字目から必ず「🏆 **ウマホ全馬期待値スコア**」で開始し、表のみを出力してください。"
     )
     
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
-    for preferred_model in models_to_try:
+    models_to_try = [
+        'gemini-1.5-flash', 
+        'models/gemini-1.5-flash',
+        'gemini-1.5-pro', 
+        'models/gemini-1.5-pro',
+        'gemini-2.0-flash'
+    ]
+    
+    last_err = None
+
+    for model_name in models_to_try:
         try:
-            m = genai.GenerativeModel(
-                preferred_model, 
-                system_instruction=system_instruction
-            )
+            try:
+                m = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+            except Exception:
+                m = genai.GenerativeModel(model_name)
+
             res = m.generate_content(prompt)
-            if res and res.text:
-                # 万が一思考ログが混ざった場合のガード（タイトル以前のテキストを削る）
-                text = res.text
+            
+            # テキストの安全抽出処理
+            text = None
+            if hasattr(res, 'candidates') and res.candidates:
+                for candidate in res.candidates:
+                    if candidate.content and candidate.content.parts:
+                        parts_text = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text')])
+                        if parts_text:
+                            text = parts_text
+                            break
+
+            if not text and hasattr(res, 'text'):
+                try:
+                    text = res.text
+                except Exception:
+                    pass
+
+            if text:
                 if "🏆" in text:
                     text = text[text.find("🏆"):]
                 return text
-        except Exception:
+        except Exception as e:
+            last_err = e
             continue
 
-    raise Exception("AIモデルの呼び出しに失敗しました。")
+    # 動的モデル取得によるバックアップ
+    try:
+        for m_info in genai.list_models():
+            if 'generateContent' in m_info.supported_generation_methods:
+                try:
+                    m = genai.GenerativeModel(m_info.name, system_instruction=system_instruction)
+                    res = m.generate_content(prompt)
+                    if hasattr(res, 'candidates') and res.candidates:
+                        for candidate in res.candidates:
+                            if candidate.content and candidate.content.parts:
+                                parts_text = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text')])
+                                if parts_text:
+                                    if "🏆" in parts_text:
+                                        parts_text = parts_text[parts_text.find("🏆"):]
+                                    return parts_text
+                except Exception as inner_e:
+                    last_err = inner_e
+                    continue
+    except Exception as list_err:
+        last_err = list_err
+
+    raise Exception(f"AI処理エラー詳細: {str(last_err)}")
 
 def process_async_prediction(user_text, reply_token, user_id):
     """バックグラウンドで処理を行うメイン関数"""
