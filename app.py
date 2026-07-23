@@ -22,19 +22,37 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 def generate_ai_response(prompt):
-    """現在サポートされている最新モデル（gemini-1.5-flash / gemini-1.5-pro）で呼び出し"""
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    """APIキーで利用可能なモデルを自動取得して呼び出す安全な関数"""
     last_error = None
-    for model_name in models_to_try:
+    
+    # 1. まずは一般的な最新モデル名を直接試す
+    for preferred_model in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']:
         try:
-            m = genai.GenerativeModel(model_name)
+            m = genai.GenerativeModel(preferred_model)
             res = m.generate_content(prompt)
             if res and res.text:
                 return res.text
         except Exception as e:
             last_error = e
-            continue
-    raise last_error if last_error else Exception("GEMINI_API_KEYが設定されていないか、利用できません。")
+
+    # 2. 直指定で全滅した場合、アカウントで利用可能なモデル一覧を動的取得して試す
+    try:
+        available_models = genai.list_models()
+        for m in available_models:
+            if 'generateContent' in m.supported_generation_methods:
+                try:
+                    # モデル名（'models/xxx'）からモデルを生成
+                    model_instance = genai.GenerativeModel(m.name)
+                    res = model_instance.generate_content(prompt)
+                    if res and res.text:
+                        return res.text
+                except Exception as inner_e:
+                    last_error = inner_e
+                    continue
+    except Exception as list_e:
+        last_error = list_e
+
+    raise last_error if last_error else Exception("利用可能なGeminiモデルが見つかりませんでした。GEMINI_API_KEYをご確認ください。")
 
 def process_async_prediction(user_text, reply_token, user_id):
     """バックグラウンドでGemini予想を生成し、LINEへPush送信する関数"""
