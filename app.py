@@ -1,4 +1,6 @@
 import os
+import re
+import urllib.parse
 import threading
 import requests
 from bs4 import BeautifulSoup
@@ -21,103 +23,191 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+}
+
+def extract_url(text):
+    """テキストからURLを抽出"""
+    match = re.search(r'https?://[^\s]+', text)
+    return match.group(0) if match else None
+
+def backup_horse_search(horse_name):
+    """【バックアップ機能】出走表で種牡馬（父）が不明な場合、Netkeiba DBを検索して取得"""
+    try:
+        encoded_name = urllib.parse.quote(horse_name.encode('euc-jp', errors='ignore'))
+        search_url = f"https://db.netkeiba.com/?pid=horse_list&word={encoded_name}"
+        res = requests.get(search_url, headers=HEADERS, timeout=4)
+        res.encoding = 'euc-jp'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        horse_table = soup.select_one('table.db_h_lst_tbl')
+        if horse_table:
+            rows = horse_table.select('tr')
+            if len(rows) > 1:
+                cols = rows[1].select('td')
+                if len(cols) > 1:
+                    detail_link = cols[1].find('a')['href']
+                    detail_res = requests.get(f"https://db.netkeiba.com{detail_link}", headers=HEADERS, timeout=4)
+                    detail_res.encoding = 'euc-jp'
+                    detail_soup = BeautifulSoup(detail_res.text, 'html.parser')
+                    
+                    blood_table = detail_soup.select_one('table.blood_table')
+                    if blood_table:
+                        sire_elem = blood_table.select_one('td[rowspan]')
+                        if sire_elem and sire_elem.find('a'):
+                            return sire_elem.find('a').text.strip()
+    except Exception:
+        pass
+    return "詳細取得失敗"
+
+def parse_netkeiba(url):
+    """NetkeibaのURLからレース条件と全出走馬データを抽出"""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=6)
+        res.encoding = res.apparent_encoding if res.apparent_encoding else 'utf-8'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # レース情報の取得
+        race_title = ""
+        title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum')
+        if title_elem:
+            race_title = title_elem.text.strip()
+
+        race_data = ""
+        data_elem = soup.select_one('.RaceData01, .race_data, .RaceData, .RaceItem')
+        if data_elem:
+            race_data = data_elem.text.strip()
+
+        # 出走馬一覧のスクレイピング
+        horses = []
+        rows = soup.select('tr.HorseList, tr.HorseInfo, table.Shutuba_Table tr, .HorseListTr, tr[class*="Horse"]')
+        
+        if not rows:
+            rows = soup.select('.Shutuba_Table tr, table tr')
+
+        for row in rows:
+            umaban_elem = row.select_one('.Umaban, .td_umaban, td.Num, .umaban')
+            bamei_elem = row.select_one('.HorseName, .Horse_Name, .bamei, a[href*="/horse/"]')
+            
+            if umaban_elem and bamei_elem:
+                umaban = umaban_elem.text.strip()
+                bamei = bamei_elem.text.strip()
+                
+                if umaban.isdigit() and bamei:
+                    sex_elem = row.select_one('.Barei, .sex_age, .Sex')
+                    jockey_elem = row.select_one('.Jockey, .jockey, .JockeyName')
+                    sire_elem = row.select_one('.Sire, .sire, .SireName')
+                    
+                    sex = sex_elem.text.strip() if sex_elem else "不明"
+                    jockey = jockey_elem.text.strip() if jockey_elem else "不明"
+                    sire = sire_elem.text.strip() if sire_elem else ""
+
+                    # 情報不足時のバックアップ検索発動
+                    if not sire or sire == "不明" or len(sire) < 2:
+                        sire = backup_horse_search(bamei)
+
+                    horses.append(f"馬番{umaban}: {bamei} ({sex} / 騎手:{jockey} / 父:{sire})")
+
+        return f"{race_title} ({race_data})", horses
+    except Exception as e:
+        return None, []
+
 def generate_ai_response(prompt):
-    """思考プロセスや英語を出力させず、直接日本語のみを返答させる関数"""
+    """数値・スコア出力に特化したGemini呼び出し関数"""
     system_instruction = (
-        "あなたはプロの競馬予想AIです。"
-        "思考プロセス、計画、英語のメモや下書きは絶対に出力しないでください。"
-        "1文字目からLINEユーザーへ送信する完成された日本語のメッセージのみを出力してください。"
+        "あなたは競馬のウマホ期待値計算AIです。"
+        "【絶対ルール】"
+        "1. 長文の解説、挨拶、根拠の説明は一切出力禁止です。"
+        "2. 1文字目から全出走馬の【ウマホ期待値スコア表（期待値の高い順）】を出力してください。"
+        "3. 表の後にシンプルなおすすめ買い目（2〜3行）のみを記載して終了してください。"
     )
     
     models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
-    last_error = None
-    
     for preferred_model in models_to_try:
         try:
-            try:
-                m = genai.GenerativeModel(preferred_model, system_instruction=system_instruction)
-            except TypeError:
-                m = genai.GenerativeModel(preferred_model)
-                
+            m = genai.GenerativeModel(preferred_model, system_instruction=system_instruction)
             res = m.generate_content(prompt)
             if res and res.text:
                 return res.text
-        except Exception as e:
-            last_error = e
+        except Exception:
+            continue
 
-    # 利用可能なモデル一覧から検索
-    try:
-        available_models = genai.list_models()
-        for m in available_models:
-            if 'generateContent' in m.supported_generation_methods:
-                try:
-                    try:
-                        model_instance = genai.GenerativeModel(m.name, system_instruction=system_instruction)
-                    except TypeError:
-                        model_instance = genai.GenerativeModel(m.name)
-                        
-                    res = model_instance.generate_content(prompt)
-                    if res and res.text:
-                        return res.text
-                except Exception as inner_e:
-                    last_error = inner_e
-                    continue
-    except Exception as list_e:
-        last_error = list_e
+    available_models = genai.list_models()
+    for m in available_models:
+        if 'generateContent' in m.supported_generation_methods:
+            try:
+                model_instance = genai.GenerativeModel(m.name, system_instruction=system_instruction)
+                res = model_instance.generate_content(prompt)
+                if res and res.text:
+                    return res.text
+            except Exception:
+                continue
 
-    raise last_error if last_error else Exception("利用可能なGeminiモデルが見つかりませんでした。")
+    raise Exception("AIモデルの呼び出しに失敗しました。")
 
 def process_async_prediction(user_text, reply_token, user_id):
-    """バックグラウンドでGemini予想を生成し、LINEへPush送信する関数"""
+    """バックグラウンドで処理を行うメイン関数"""
     try:
-        # 1. 即時返信（タイムアウト防止）
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text=f"【受付完了】\n「{user_text}」の分析処理を開始しました！\n予想の生成完了まで数秒お待ちください... 🏇")
-        )
+        url = extract_url(user_text)
+        
+        if url and 'netkeiba' in url:
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text="【受付完了】\nNetkeibaの出走表データを取得中...（バックアップ検索機能稼働中）🏇")
+            )
+            
+            race_info, horses = parse_netkeiba(url)
+            
+            if horses:
+                horses_str = "\n".join(horses)
+                prompt = f"""
+以下のNetkeibaデータに基づき、ウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／条件緩和／期待値算出）を適用した【全馬の期待値スコア】を出力してください。
 
-        # 2. Geminiでの予想生成
-        prompt = f"""
-【最重要ルール】
-・思考プロセス（英語の思考ログやメモ・下書き）は絶対に出力しないでください。
-・1文字目から「【ウマホ競馬予想分析】」で始め、完全な日本語文章のみを出力してください。
+【レース情報】
+{race_info}
 
----
-あなたはウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／優先度に基づく条件緩和／期待値算出）に熟知したプロの競馬予想AIです。
-以下の依頼内容に基づき、説得力のある競馬予想を作成してください。
-
-【依頼内容】
-{user_text}
+【出走馬データ】
+{horses_str}
 
 【出力フォーマット】
-【ウマホ競馬予想分析】
-1. 本命・対抗・穴馬の評価
-2. 予想の根拠と解説（ウマホの期待値視点）
-3. おすすめの買い目
+🏆 **ウマホ全馬期待値スコア**
 
-※注意：全体で【1,000字〜1,500字程度】の読みやすい日本語メッセージとして出力してください。
+| 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | ウマホ期待値 | 評価 |
+|---|---|---|---|---|---|---|
+| ◎ | X | 馬名 | 牡X | 種牡馬 | 88 / 100 | S |
+| ○ | X | 馬名 | 牝X | 種牡馬 | 79 / 100 | A |
+...
+
+💡 **買い目目安**
+・馬連/ワイド：◎ - ○, ▲, △
+・3連複：◎ - ○, ▲ - ○, ▲, △, ☆
 """
+            else:
+                prompt = f"URLからの情報取得に一部制限があったため、以下の入力から全馬の期待値スコア表を作成してください:\n{user_text}"
+        else:
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text="【受付完了】\nデータ分析中... 期待値スコアを計算中です 🏇")
+            )
+            prompt = f"以下のテキストから全馬のウマホ期待値スコア表を作成してください:\n{user_text}"
+
         response_text = generate_ai_response(prompt)
 
-        # LINEの5,000文字上限を超えないよう安全にカット
         if len(response_text) > 4500:
-            response_text = response_text[:4500] + "\n\n...(文字数制限のため一部省略)"
+            response_text = response_text[:4500] + "\n...(一部省略)"
 
-        # 3. 予想メッセージの送信
         line_bot_api.push_message(
             user_id,
             TextSendMessage(text=response_text)
         )
 
     except Exception as e:
-        error_msg = f"⚠️ エラーが発生しました。\n\n【詳細原因】\n{str(e)}"
-        if len(error_msg) > 4000:
-            error_msg = error_msg[:4000]
-            
+        error_msg = f"⚠️ エラーが発生しました。\n\n【詳細】\n{str(e)}"
         try:
             line_bot_api.push_message(
                 user_id,
-                TextSendMessage(text=error_msg)
+                TextSendMessage(text=error_msg[:4000])
             )
         except Exception:
             pass
