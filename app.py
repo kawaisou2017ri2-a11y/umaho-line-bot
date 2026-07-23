@@ -22,10 +22,8 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 def generate_ai_response(prompt):
-    """APIキーで利用可能なモデルを自動取得して呼び出す安全な関数"""
+    """利用可能なモデルでAIテキストを生成"""
     last_error = None
-    
-    # 1. まずは一般的な最新モデル名を直接試す
     for preferred_model in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']:
         try:
             m = genai.GenerativeModel(preferred_model)
@@ -35,13 +33,11 @@ def generate_ai_response(prompt):
         except Exception as e:
             last_error = e
 
-    # 2. 直指定で全滅した場合、アカウントで利用可能なモデル一覧を動的取得して試す
     try:
         available_models = genai.list_models()
         for m in available_models:
             if 'generateContent' in m.supported_generation_methods:
                 try:
-                    # モデル名（'models/xxx'）からモデルを生成
                     model_instance = genai.GenerativeModel(m.name)
                     res = model_instance.generate_content(prompt)
                     if res and res.text:
@@ -52,7 +48,7 @@ def generate_ai_response(prompt):
     except Exception as list_e:
         last_error = list_e
 
-    raise last_error if last_error else Exception("利用可能なGeminiモデルが見つかりませんでした。GEMINI_API_KEYをご確認ください。")
+    raise last_error if last_error else Exception("利用可能なGeminiモデルが見つかりませんでした。")
 
 def process_async_prediction(user_text, reply_token, user_id):
     """バックグラウンドでGemini予想を生成し、LINEへPush送信する関数"""
@@ -63,7 +59,7 @@ def process_async_prediction(user_text, reply_token, user_id):
             TextSendMessage(text=f"【受付完了】\n「{user_text}」の分析処理を開始しました！\n予想の生成完了まで数秒お待ちください... 🏇")
         )
 
-        # 2. Geminiでの予想生成
+        # 2. Geminiでの予想生成（文字数制限の指示を追加）
         prompt = f"""
 あなたはウマホの分析ロジックに熟知したプロの競馬予想AIです。
 以下の依頼内容に基づき、説得力のある競馬予想を作成してください。
@@ -73,10 +69,16 @@ def process_async_prediction(user_text, reply_token, user_id):
 
 【出力フォーマット】
 1. 本命・対抗・穴馬の評価
-2. 予想の根拠と解説
+2. 予想の根拠と解説（ウマホの期待値視点）
 3. おすすめの買い目
+
+※注意：LINEの送信制限があるため、全体で【1,500字〜2,000字程度】で読みやすく整理して出力してください。
 """
         response_text = generate_ai_response(prompt)
+
+        # LINEの5,000文字上限を超えないよう安全にカット（トリミング）
+        if len(response_text) > 4500:
+            response_text = response_text[:4500] + "\n\n...(文字数制限のため一部省略)"
 
         # 3. 予想メッセージの送信
         line_bot_api.push_message(
@@ -86,6 +88,10 @@ def process_async_prediction(user_text, reply_token, user_id):
 
     except Exception as e:
         error_msg = f"⚠️ エラーが発生しました。\n\n【詳細原因】\n{str(e)}"
+        # エラーメッセージ自体も文字数制限に引っかからないようトリミング
+        if len(error_msg) > 4000:
+            error_msg = error_msg[:4000]
+            
         try:
             line_bot_api.push_message(
                 user_id,
