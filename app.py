@@ -22,23 +22,40 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 def generate_ai_response(prompt):
-    """利用可能なモデルでAIテキストを生成"""
+    """思考プロセスや英語を出力させず、直接日本語のみを返答させる関数"""
+    system_instruction = (
+        "あなたはプロの競馬予想AIです。"
+        "思考プロセス、計画、英語のメモや下書きは絶対に出力しないでください。"
+        "1文字目からLINEユーザーへ送信する完成された日本語のメッセージのみを出力してください。"
+    )
+    
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
     last_error = None
-    for preferred_model in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']:
+    
+    for preferred_model in models_to_try:
         try:
-            m = genai.GenerativeModel(preferred_model)
+            try:
+                m = genai.GenerativeModel(preferred_model, system_instruction=system_instruction)
+            except TypeError:
+                m = genai.GenerativeModel(preferred_model)
+                
             res = m.generate_content(prompt)
             if res and res.text:
                 return res.text
         except Exception as e:
             last_error = e
 
+    # 利用可能なモデル一覧から検索
     try:
         available_models = genai.list_models()
         for m in available_models:
             if 'generateContent' in m.supported_generation_methods:
                 try:
-                    model_instance = genai.GenerativeModel(m.name)
+                    try:
+                        model_instance = genai.GenerativeModel(m.name, system_instruction=system_instruction)
+                    except TypeError:
+                        model_instance = genai.GenerativeModel(m.name)
+                        
                     res = model_instance.generate_content(prompt)
                     if res and res.text:
                         return res.text
@@ -59,25 +76,26 @@ def process_async_prediction(user_text, reply_token, user_id):
             TextSendMessage(text=f"【受付完了】\n「{user_text}」の分析処理を開始しました！\n予想の生成完了まで数秒お待ちください... 🏇")
         )
 
-        # 2. Geminiでの予想生成（日本語出力を強力に強制）
+        # 2. Geminiでの予想生成
         prompt = f"""
-【最重要指示】
-思考プロセス、考察、出力メッセージを含め、すべての文章を**必ず完全な「日本語のみ」**で作成してください。英語は1文字も出力・思考ログに出さないでください。
+【最重要ルール】
+・思考プロセス（英語の思考ログやメモ・下書き）は絶対に出力しないでください。
+・1文字目から「【ウマホ競馬予想分析】」で始め、完全な日本語文章のみを出力してください。
 
 ---
-
 あなたはウマホの分析ロジック（固定条件：種牡馬・性別・芝ダ／優先度に基づく条件緩和／期待値算出）に熟知したプロの競馬予想AIです。
-以下の依頼内容に基づき、説得力のある競馬予想をすべて日本語で作成してください。
+以下の依頼内容に基づき、説得力のある競馬予想を作成してください。
 
 【依頼内容】
 {user_text}
 
 【出力フォーマット】
+【ウマホ競馬予想分析】
 1. 本命・対抗・穴馬の評価
 2. 予想の根拠と解説（ウマホの期待値視点）
 3. おすすめの買い目
 
-※注意：LINEの送信制限があるため、全体で【1,500字〜2,000字程度】で読みやすく整理して日本語で出力してください。
+※注意：全体で【1,000字〜1,500字程度】の読みやすい日本語メッセージとして出力してください。
 """
         response_text = generate_ai_response(prompt)
 
