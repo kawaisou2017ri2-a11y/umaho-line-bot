@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import urllib.parse
 import threading
 import requests
@@ -126,13 +127,11 @@ def clean_japanese_output(text):
     if not text:
         return ""
     
-    # 🏆マーク以降を抽出
     if "🏆" in text:
         text = text[text.find("🏆"):]
     elif "|" in text:
         text = text[text.find("|"):]
 
-    # 日本語・表以外の行（英語のみの行など）を除外
     lines = text.splitlines()
     cleaned_lines = []
     for line in lines:
@@ -142,7 +141,7 @@ def clean_japanese_output(text):
     return "\n".join(cleaned_lines).strip()
 
 def generate_ai_response(prompt):
-    """Gemini応答生成関数"""
+    """【対策B適用】レート制限（429）発生時に自動待機＆モデル順次フォールバック"""
     system_instruction = (
         "あなたは競馬のウマホ期待値計算AIです。\n"
         "【最重要ルール】\n"
@@ -151,45 +150,56 @@ def generate_ai_response(prompt):
         "3. 1文字目から必ず「🏆 **ウマホ全馬期待値スコア**」で始め、表形式のみを出力すること。"
     )
     
+    # 試行するモデルの優先順位（1.5系は比較的制限に余裕あり）
     models_to_try = [
-        'gemini-1.5-flash', 
+        'gemini-1.5-flash',
         'models/gemini-1.5-flash',
-        'gemini-1.5-pro', 
+        'gemini-1.5-pro',
         'models/gemini-1.5-pro',
-        'gemini-2.0-flash'
+        'gemini-2.0-flash',
+        'models/gemini-2.0-flash'
     ]
     
     last_err = None
 
     for model_name in models_to_try:
-        try:
-            m = genai.GenerativeModel(model_name, system_instruction=system_instruction)
-            res = m.generate_content(prompt)
-            
-            raw_text = None
-            if hasattr(res, 'candidates') and res.candidates:
-                for candidate in res.candidates:
-                    if candidate.content and candidate.content.parts:
-                        parts_text = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text')])
-                        if parts_text:
-                            raw_text = parts_text
-                            break
+        # 1つのモデルにつき最大2回までリトライ（429対策）
+        for attempt in range(2):
+            try:
+                m = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+                res = m.generate_content(prompt)
+                
+                raw_text = None
+                if hasattr(res, 'candidates') and res.candidates:
+                    for candidate in res.candidates:
+                        if candidate.content and candidate.content.parts:
+                            parts_text = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text')])
+                            if parts_text:
+                                raw_text = parts_text
+                                break
 
-            if not raw_text and hasattr(res, 'text'):
-                try:
-                    raw_text = res.text
-                except Exception:
-                    pass
+                if not raw_text and hasattr(res, 'text'):
+                    try:
+                        raw_text = res.text
+                    except Exception:
+                        pass
 
-            if raw_text:
-                cleaned = clean_japanese_output(raw_text)
-                if cleaned:
-                    return cleaned
-        except Exception as e:
-            last_err = e
-            continue
+                if raw_text:
+                    cleaned = clean_japanese_output(raw_text)
+                    if cleaned:
+                        return cleaned
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                
+                # 429エラー（Quota/Rate limit）が起きた場合は2秒待機してリトライまたは次モデルへ
+                if '429' in err_str or 'quota' in err_str.lower():
+                    time.sleep(2)
+                    continue
+                else:
+                    break
 
-    raise Exception(f"AI処理エラー: {str(last_err)}")
+    raise Exception(f"AI処理エラー（制限回避不可）: {str(last_err)}")
 
 def process_async_prediction(user_text, reply_token, user_id):
     """バックグラウンド処理メイン関数"""
