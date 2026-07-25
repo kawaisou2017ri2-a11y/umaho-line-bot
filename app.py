@@ -18,9 +18,9 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# PC版ブラウザに偽装するヘッダー（データの確実な取得のため）
+# スマホ専用 User-Agent（Netkeibaの軽量HTMLを確実に取得するため）
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 }
 
 # 重馬場・道悪で評価が上がる血統リスト
@@ -44,14 +44,6 @@ def extract_track_condition(text):
     elif '良' in text:
         return '良'
     return '良'
-
-def convert_to_pc_netkeiba_url(url):
-    """スマホ版・新聞・予想などあらゆるNetkeiba URLを安定したPC版標準出走表URLに変換"""
-    race_id_match = re.search(r'race_id=(\d+)', url)
-    if race_id_match:
-        race_id = race_id_match.group(1)
-        return f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    return url
 
 def backup_horse_search(horse_name):
     """【バックアップ機能】出走表で種牡馬（父）が不明な場合、Netkeiba DBを検索して取得"""
@@ -82,61 +74,108 @@ def backup_horse_search(horse_name):
         pass
     return "不明"
 
-def parse_netkeiba(url):
-    """NetkeibaのURLからレース条件と全出走馬データを抽出"""
+def parse_netkeiba(raw_url):
+    """NetkeibaのURLから race_id を特定し、スマホ版HTMLから確実に全馬データを解析"""
     try:
-        # PC版URLへ強制変換
-        pc_url = convert_to_pc_netkeiba_url(url)
-        
-        res = requests.get(pc_url, headers=HEADERS, timeout=6)
-        res.encoding = res.apparent_encoding if res.apparent_encoding else 'euc-jp'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        race_title = ""
-        title_elem = soup.select_one('.RaceName, .RaceNum')
-        if title_elem:
-            race_title = title_elem.text.strip()
+        # URLから race_id (数字10〜12桁) を正規表現で抽出
+        race_id_match = re.search(r'race_id=(\d{10,12})', raw_url)
+        if not race_id_match:
+            race_id_match = re.search(r'/race/(\d{10,12})', raw_url)
+            
+        if not race_id_match:
+            return None, []
 
-        race_data = ""
-        data_elem = soup.select_one('.RaceData01')
-        if data_elem:
-            race_data = data_elem.text.strip()
+        race_id = race_id_match.group(1)
+
+        # 試行するスマホ版URLリスト (標準出走表 -> 競馬新聞)
+        candidate_urls = [
+            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
+            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}"
+        ]
 
         horses = []
-        # PC版テーブルの行を取得
-        rows = soup.select('tr.HorseList')
-        if not rows:
-            rows = soup.select('table.Shutuba_Table tr')
+        race_title = "レース"
 
-        for row in rows:
-            umaban_elem = row.select_one('td.Umaban, .td_umaban, td.Num')
-            bamei_elem = row.select_one('span.HorseName a, .HorseName, .HorseInfo a')
-            
-            if umaban_elem and bamei_elem:
-                umaban = umaban_elem.text.strip()
-                bamei = bamei_elem.text.strip()
+        for target_url in candidate_urls:
+            try:
+                res = requests.get(target_url, headers=HEADERS, timeout=5)
+                res.encoding = res.apparent_encoding if res.apparent_encoding else 'utf-8'
+                soup = BeautifulSoup(res.text, 'html.parser')
+
+                # タイトル取得
+                title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum, .Race_Title')
+                if title_elem and title_elem.text.strip():
+                    race_title = title_elem.text.strip()
+
+                # 馬名リンク (/horse/ 含む a タグ) を起点に全出走馬を抽出
+                horse_links = soup.find_all('a', href=re.compile(r'/horse/\d+'))
                 
-                if umaban.isdigit() and bamei:
-                    sex_elem = row.select_one('td.Barei, .Barei')
-                    jockey_elem = row.select_one('td.Jockey a, .Jockey')
-                    sire_elem = row.select_one('td.Sire, .Sire')
+                seen_bamei = set()
+                temp_horses = []
+
+                for a_tag in horse_links:
+                    bamei = a_tag.text.strip()
+                    # 不要なナビゲーションリンクの除外
+                    if not bamei or len(bamei) < 2 or bamei in ['写真', '掲示板', '血統', '映像', '出走表', 'オッズ', 'ニュース', 'データベース']:
+                        continue
+                    if bamei in seen_bamei:
+                        continue
+
+                    # 親要素（行）を取得
+                    row_block = a_tag.find_parent(['tr', 'li', 'div', 'dd'])
                     
-                    sex = sex_elem.text.strip() if sex_elem else "不明"
-                    jockey = jockey_elem.text.strip() if jockey_elem else "不明"
-                    sire = sire_elem.text.strip() if sire_elem else ""
+                    umaban = "0"
+                    sex = "不明"
+                    jockey = "不明"
+                    sire = ""
 
-                    if not sire or sire == "不明" or len(sire) < 2:
-                        sire = backup_horse_search(bamei)
+                    if row_block:
+                        # 馬番取得
+                        umaban_elem = row_block.select_one('.Umaban, .td_umaban, .Num, .num, td.Num, .Umaban_Num')
+                        if umaban_elem:
+                            num_m = re.search(r'\d+', umaban_elem.text)
+                            if num_m:
+                                umaban = num_m.group(0)
 
-                    horses.append({
-                        'umaban': int(umaban),
+                        # 性齢取得
+                        sex_elem = row_block.select_one('.Barei, .sex_age, .Sex, .Age, .Barei_Sex')
+                        if sex_elem:
+                            sex = sex_elem.text.strip()
+
+                        # 騎手取得
+                        jockey_elem = row_block.select_one('.Jockey, .jockey, .JockeyName, a[href*="/jockey/"]')
+                        if jockey_elem:
+                            jockey = jockey_elem.text.strip()
+
+                        # 父（種牡馬）取得
+                        sire_elem = row_block.select_one('.Sire, .sire, .SireName, a[href*="/sire/"]')
+                        if sire_elem:
+                            sire = sire_elem.text.strip()
+
+                    seen_bamei.add(bamei)
+                    temp_horses.append({
+                        'umaban': int(umaban) if umaban.isdigit() and int(umaban) > 0 else len(temp_horses) + 1,
                         'bamei': bamei,
                         'sex': sex,
                         'jockey': jockey,
                         'sire': sire
                     })
 
-        return f"{race_title} ({race_data})", horses
+                if temp_horses:
+                    horses = temp_horses
+                    break
+            except Exception:
+                continue
+
+        # 馬番順に並び替え
+        horses.sort(key=lambda x: x['umaban'])
+
+        # 種牡馬が未取得の馬があれば、Netkeiba DBから個別自動取得
+        for h in horses:
+            if not h['sire'] or h['sire'] == "不明" or len(h['sire']) < 2:
+                h['sire'] = backup_horse_search(h['bamei'])
+
+        return race_title, horses
     except Exception as e:
         return None, []
 
