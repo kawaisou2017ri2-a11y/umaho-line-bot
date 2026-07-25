@@ -1,6 +1,5 @@
 import os
 import re
-import urllib.parse
 import hashlib
 import requests
 from bs4 import BeautifulSoup
@@ -26,12 +25,12 @@ HEADERS = {
 HEAVY_TRACK_SIRES = [
     'キズナ', 'エピファネイア', 'ドゥラメンテ', 'オルフェーヴル', 'ゴールドシップ', 
     'ハービンジャー', 'モーリス', 'キタサンブラック', 'ルーラーシップ', 'フィエールマン', 
-    'サートゥルナーリア', 'サトノダイヤモンド', 'シスキン'
+    'サートゥルナーリア', 'サトノダイヤモンド', 'シスキン', 'ジャングルポケット', 'ディープインパクト'
 ]
 # トップ騎手リスト
 TOP_JOCKEYS = [
     'ルメール', '川田', '武豊', '横山武', '戸崎', '坂井', 'レーン', 
-    'モレイラ', 'デムーロ', '鮫島駿', '丹内', '長浜', '舟山', '河原田'
+    'モレイラ', 'デムーロ', '鮫島駿', '丹内', '長浜', '舟山', '河原田', '高杉'
 ]
 
 def extract_url(text):
@@ -51,53 +50,16 @@ def extract_track_condition(text):
         return '良'
     return '良'
 
-def clean_horse_name(name):
-    """馬名に含まれる改行・空白・余計なデータベース文字列を徹底洗浄"""
-    if not name:
+def clean_text(text):
+    """改行や余計なデータベース文字列を削除"""
+    if not text:
         return ""
-    # 1. 改行・タブ・連続スペースの除去
-    name = re.sub(r'[\r\n\t]+', '', name)
-    name = name.strip()
-    # 2. 末尾の不要ワード（のデータベース、の競走馬データ、データベース等）を除去
-    name = re.sub(r'(の?(データベース|競走馬データ|掲示板|血統|オッズ|戦績|情報|プロフィール|写真))+$', '', name)
-    return name.strip()
-
-def backup_horse_search(horse_name):
-    """【高速バックアップ】馬名からNetkeiba DBを検索し、父（種牡馬）と性齢を取得"""
-    try:
-        clean_name = clean_horse_name(horse_name)
-        if not clean_name or len(clean_name) < 2:
-            return "不明", "不明"
-
-        encoded_name = urllib.parse.quote(clean_name.encode('euc-jp', errors='ignore'))
-        search_url = f"https://db.netkeiba.com/?pid=horse_list&word={encoded_name}"
-        res = requests.get(search_url, headers=HEADERS, timeout=3)
-        res.encoding = 'euc-jp'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        horse_table = soup.select_one('table.db_h_lst_tbl')
-        sire = "不明"
-        sex = "不明"
-
-        if horse_table:
-            rows = horse_table.select('tr')
-            if len(rows) > 1:
-                cols = rows[1].select('td')
-                # 通常: cols[1]=馬名, cols[2]=性齢, cols[3]=父
-                if len(cols) >= 4:
-                    sex_text = cols[2].text.strip()
-                    sire_text = cols[3].text.strip()
-                    if sex_text:
-                        sex = sex_text
-                    if sire_text:
-                        sire = sire_text
-        return sire, sex
-    except Exception:
-        pass
-    return "不明", "不明"
+    text = re.sub(r'[\r\n\t]+', '', text)
+    text = re.sub(r'(の?(データベース|競走馬データ|掲示板|血統|オッズ|戦績|情報|プロフィール|写真))+$', '', text)
+    return text.strip()
 
 def parse_netkeiba(raw_url):
-    """NetkeibaのURLから race_id を特定し、出走馬データを完全解析"""
+    """1回のリクエストで出走馬データを爆速一括抽出（タイムアウト防止）"""
     try:
         race_id_match = re.search(r'race_id=(\d{10,12})', raw_url)
         if not race_id_match:
@@ -108,92 +70,69 @@ def parse_netkeiba(raw_url):
 
         race_id = race_id_match.group(1)
 
-        candidate_urls = [
-            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}",
-            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
-        ]
+        # 情報が一番詰まっている新聞ページへ1発アクセス
+        target_url = f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}"
+        
+        res = requests.get(target_url, headers=HEADERS, timeout=5)
+        res.encoding = res.apparent_encoding if res.apparent_encoding else 'utf-8'
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        race_title = "レース"
+        title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum, .Race_Title')
+        if title_elem and title_elem.text.strip():
+            race_title = title_elem.text.strip()
 
         horses = []
-        race_title = "レース"
+        seen_bamei = set()
 
-        for target_url in candidate_urls:
-            try:
-                res = requests.get(target_url, headers=HEADERS, timeout=5)
-                res.encoding = res.apparent_encoding if res.apparent_encoding else 'utf-8'
-                soup = BeautifulSoup(res.text, 'html.parser')
+        # 馬のブロック要素（行）を巡回
+        blocks = soup.select('tr, li, .HorseList, .Shutuba_Table tr, div[class*="Horse"]')
 
-                title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum, .Race_Title')
-                if title_elem and title_elem.text.strip():
-                    race_title = title_elem.text.strip()
-
-                horse_links = soup.find_all('a', href=re.compile(r'/horse/\d+'))
-                seen_bamei = set()
-                temp_horses = []
-
-                for a_tag in horse_links:
-                    raw_bamei = a_tag.text
-                    bamei = clean_horse_name(raw_bamei)
-
-                    # 無効な名称や重複馬のスキップ
-                    if not bamei or len(bamei) < 2 or bamei in ['写真', '掲示板', '血統', '映像', '出走表', 'オッズ', 'ニュース', 'データベース']:
-                        continue
-                    if bamei in seen_bamei:
-                        continue
-
-                    # 重複防止セットに即時追加
-                    seen_bamei.add(bamei)
-
-                    row_block = a_tag.find_parent(['tr', 'li', 'div', 'dd'])
-                    
-                    umaban = "0"
-                    sex = "不明"
-                    jockey = "不明"
-                    sire = ""
-
-                    if row_block:
-                        # 馬番
-                        umaban_elem = row_block.select_one('.Umaban, .td_umaban, .Num, .num, td.Num, .Umaban_Num')
-                        if umaban_elem:
-                            num_m = re.search(r'\d+', umaban_elem.text)
-                            if num_m:
-                                umaban = num_m.group(0)
-
-                        # 性齢
-                        sex_elem = row_block.select_one('.Barei, .sex_age, .Sex, .Age, .Barei_Sex')
-                        if sex_elem:
-                            sex = sex_elem.text.strip()
-
-                        # 騎手
-                        jockey_elem = row_block.select_one('.Jockey, .jockey, .JockeyName, a[href*="/jockey/"]')
-                        if jockey_elem:
-                            jockey = jockey_elem.text.strip()
-
-                        # 父
-                        sire_elem = row_block.select_one('.Sire, .sire, .SireName, a[href*="/sire/"]')
-                        if sire_elem:
-                            sire = sire_elem.text.strip()
-
-                    # 父または性齢が未取得の場合、高速バックアップ検索を実行
-                    if not sire or sire == "不明" or len(sire) < 2 or sex == "不明":
-                        db_sire, db_sex = backup_horse_search(bamei)
-                        if not sire or sire == "不明":
-                            sire = db_sire
-                        if sex == "不明":
-                            sex = db_sex
-
-                    temp_horses.append({
-                        'umaban': int(umaban) if umaban.isdigit() and int(umaban) > 0 else len(temp_horses) + 1,
-                        'bamei': bamei,
-                        'sex': sex,
-                        'jockey': jockey,
-                        'sire': sire
-                    })
-
-                if temp_horses:
-                    horses = temp_horses
-                    break
-            except Exception:
+        for block in blocks:
+            a_tag = block.find('a', href=re.compile(r'/horse/\d+'))
+            if not a_tag:
                 continue
+
+            bamei = clean_text(a_tag.text)
+            if not bamei or len(bamei) < 2 or bamei in ['写真', '掲示板', '血統', '映像', '出走表', 'オッズ', 'ニュース', 'データベース']:
+                continue
+            if bamei in seen_bamei:
+                continue
+
+            # 馬番
+            umaban = "0"
+            umaban_elem = block.select_one('.Umaban, .td_umaban, .Num, .num, td.Num, .Umaban_Num')
+            if umaban_elem:
+                num_m = re.search(r'\d+', umaban_elem.text)
+                if num_m:
+                    umaban = num_m.group(0)
+
+            # 性齢
+            sex = "不明"
+            sex_elem = block.select_one('.Barei, .sex_age, .Sex, .Age, .Barei_Sex')
+            if sex_elem:
+                sex = clean_text(sex_elem.text)
+
+            # 騎手
+            jockey = "不明"
+            jockey_elem = block.select_one('.Jockey, .jockey, .JockeyName, a[href*="/jockey/"]')
+            if jockey_elem:
+                jockey = clean_text(jockey_elem.text)
+
+            # 父馬（種牡馬）
+            sire = "不明"
+            sire_elem = block.select_one('.Sire, .sire, .SireName, a[href*="/sire/"]')
+            if sire_elem:
+                sire = clean_text(sire_elem.text)
+
+            seen_bamei.add(bamei)
+            horses.append({
+                'umaban': int(umaban) if umaban.isdigit() and int(umaban) > 0 else len(horses) + 1,
+                'bamei': bamei,
+                'sex': sex if sex else "不明",
+                'jockey': jockey if jockey else "不明",
+                'sire': sire if sire else "不明"
+            })
 
         horses.sort(key=lambda x: x['umaban'])
         return race_title, horses
@@ -205,7 +144,6 @@ def calculate_local_umaho_scores(horses, track_condition):
     scored_horses = []
 
     for h in horses:
-        # 洗浄済み馬名で基本スコア（能力ハッシュ）を生成
         hash_val = int(hashlib.md5(h['bamei'].encode('utf-8')).hexdigest(), 16)
         base_score = 60 + (hash_val % 26)
 
