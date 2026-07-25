@@ -1,6 +1,7 @@
 import os
 import re
-import hashlib
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -8,249 +9,169 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 環境変数の読み込み
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 重馬場・道悪で評価が上がる血統リスト
-HEAVY_TRACK_SIRES = [
-    'キズナ', 'エピファネイア', 'ドゥラメンテ', 'オルフェーヴル', 'ゴールドシップ', 
-    'ハービンジャー', 'モーリス', 'キタサンブラック', 'ルーラーシップ', 'フィエールマン', 
-    'サートゥルナーリア', 'サトノダイヤモンド', 'シスキン', 'ジャングルポケット', 'ディープインパクト',
-    'コントレイル'
-]
+def parse_race_info(user_text):
+    """レース基本情報と各馬のデータを抽出"""
+    lines = [l.strip() for l in user_text.strip().splitlines() if l.strip()]
+    header = lines[0] if lines else ""
 
-# トップ騎手リスト
-TOP_JOCKEYS = [
-    'ルメール', '川田', '武豊', '横山武', '横山和', '戸崎', '坂井', 'レーン', 
-    'モレイラ', 'デムーロ', '鮫島克', '鮫島駿', '丹内', '長浜', '舟山', '河原田', '高杉',
-    '西村淳', '佐々木', '浜中', '松本', '古川奈', '小林美'
-]
-
-def parse_race_conditions(text):
-    """レース全体条件（競馬場・トラック・距離・馬場状態）を抽出"""
-    conds = {
-        'venue': '不明',
-        'track': '芝',
-        'distance': '2000m',
-        'condition': '良'
-    }
-    
-    # 本文中の誤判定を防ぐため、1行目（ヘッダー）のみを対象に条件抽出
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    header = lines[0] if lines else text
-
-    # 競馬場
-    venues = ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']
-    for v in venues:
+    venue = "札幌"
+    for v in ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']:
         if v in header:
-            conds['venue'] = v
+            venue = v
             break
 
-    # トラック判定
-    if 'ダート' in header or ('ダ' in header and '芝' not in header):
-        conds['track'] = 'ダート'
-    elif '芝' in header:
-        conds['track'] = '芝'
-
-    # 距離
+    track = "ダート" if "ダート" in header or ("ダ" in header and "芝" not in header) else "芝"
+    
     dist_m = re.search(r'(\d{3,4})m?', header)
-    if dist_m:
-        conds['distance'] = f"{dist_m.group(1)}m"
+    distance = f"{dist_m.group(1)}m" if dist_m else "2000m"
 
-    # 馬場状態
-    if '不良' in header:
-        conds['condition'] = '不良'
-    elif '稍重' in header:
-        conds['condition'] = '稍重'
-    elif '重' in header:
-        conds['condition'] = '重'
-    else:
-        conds['condition'] = '良'
+    condition = "良"
+    for c in ['不良', '稍重', '重', '良']:
+        if c in header:
+            condition = c
+            break
 
-    return conds
-
-def parse_pasted_text(raw_text):
-    """複数行（キー:値形式）および1行形式の両方に対応する高精度パース"""
     horses = []
-    
-    blocks = re.split(r'\n\s*\n', raw_text.strip())
-    
-    if len(blocks) <= 1:
-        raw_blocks = re.split(r'(?=\n\d{1,2}\s+[\u30A1-\u30FC]{2,9})', raw_text)
-        if len(raw_blocks) > 1:
-            blocks = raw_blocks
+    blocks = re.split(r'\n\s*\n', user_text.strip())
 
     for block in blocks:
-        block_text = block.strip()
-        if not block_text:
+        lines_b = [l.strip() for l in block.splitlines() if l.strip()]
+        if not lines_b:
             continue
 
-        lines = [l.strip() for l in block_text.splitlines() if l.strip()]
-        
-        # ヘッダー行のスキップ
-        if any(v in lines[0] for v in ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']) and ('芝' in lines[0] or 'ダ' in lines[0] or 'm' in lines[0]):
-            continue
+        bamei, umaban, sire, sex, waku, jockey, dist_change, weight = "不明", 0, "不明", "牡", 1, "不明", "同距離", 450
 
-        bamei = "不明"
-        umaban = 0
-        sire = "不明"
-        sex = "不明"
-        waku = 0
-        jockey = "不明"
-        dist_change = "不明"
-
-        for line in lines:
-            # 1. 馬番と馬名
+        for line in lines_b:
             m_horse = re.search(r'^(\d{1,2})[\s\.\:]+([\u30A1-\u30FC]{2,9})', line)
             if m_horse:
                 umaban = int(m_horse.group(1))
                 bamei = m_horse.group(2)
                 continue
 
-            # 2. 種牡馬
             if '種牡馬' in line or '父' in line:
                 m_sire = re.search(r'(?:種牡馬|父)[\s\:\：]*([\u30A1-\u30FCa-zA-Z0-9\s]{2,15})', line)
-                if m_sire:
-                    sire = m_sire.group(1).strip()
-                continue
-
-            # 3. 性別 / 性齢
-            if '性別' in line or '性齢' in line or re.search(r'[牡牝セ]\d', line):
-                m_sex = re.search(r'([牡牝セ]\d{1,2}|[牡牝セ])', line)
-                if m_sex:
-                    sex = m_sex.group(1)
-                continue
-
-            # 4. 枠
-            if '枠' in line:
+                if m_sire: sire = m_sire.group(1).strip()
+            elif '性別' in line or '性齢' in line:
+                m_sex = re.search(r'([牡牝セ])', line)
+                if m_sex: sex = m_sex.group(1)
+            elif '枠' in line:
                 m_waku = re.search(r'枠[\s\:\：]*(\d{1,2})', line)
-                if m_waku:
-                    waku = int(m_waku.group(1))
-                continue
-
-            # 5. 騎手
-            if '騎手' in line:
+                if m_waku: waku = int(m_waku.group(1))
+            elif '騎手' in line:
                 m_jockey = re.search(r'騎手[\s\:\：]*([^\s]+)', line)
-                if m_jockey:
-                    jockey = m_jockey.group(1)
-                continue
-
-            # 6. 前走比
-            if '前走比' in line or '距離' in line:
-                m_dist = re.search(r'(前走比[\s\:\：]*[^\n]+|距離(?:延長|短縮|同距離)[^\n]*)', line)
-                if m_dist:
-                    dist_change = m_dist.group(1)
-                continue
-
-        # フォールバック処理
-        if bamei == "不明":
-            for line in lines:
-                m_inline = re.search(r'(\d{1,2})\s+([\u30A1-\u30FC]{2,9})', line)
-                if m_inline:
-                    umaban = int(m_inline.group(1))
-                    bamei = m_inline.group(2)
-                    
-                    m_sex_inline = re.search(r'([牡牝セ]\d{1,2})', line)
-                    if m_sex_inline:
-                        sex = m_sex_inline.group(1)
-                        
-                    kana_words = re.findall(r'[\u30A1-\u30FC]{2,9}', line)
-                    invalid_words = ['データベース', '掲示板', '血統', 'オッズ', '出走表', 'ニュース', '写真', '調教', '予想']
-                    kana_words = [w for w in kana_words if w not in invalid_words and w != bamei]
-                    if kana_words:
-                        sire = kana_words[0]
+                if m_jockey: jockey = m_jockey.group(1)
+            elif '前走比' in line or '距離' in line:
+                if '延長' in line: dist_change = "距離延長"
+                elif '短縮' in line: dist_change = "距離短縮"
+                else: dist_change = "同距離"
+            elif '体重' in line or 'kg' in line:
+                m_wt = re.search(r'(\d{3})kg', line)
+                if m_wt: weight = int(m_wt.group(1))
 
         if bamei != "不明":
             horses.append({
-                'umaban': umaban if umaban > 0 else len(horses) + 1,
+                'umaban': umaban,
                 'bamei': bamei,
                 'sire': sire,
                 'sex': sex,
-                'waku': waku if waku > 0 else (umaban // 2 + 1 if umaban > 0 else 0),
+                'track': track,
+                'condition': condition,
+                'venue': venue,
+                'distance': distance,
+                'weight': "500kg以上" if weight >= 500 else "500kg未満",
+                'waku': waku,
                 'jockey': jockey,
                 'dist_change': dist_change
             })
 
-    horses.sort(key=lambda x: x['umaban'])
-    return horses
+    return {'venue': venue, 'track': track, 'distance': distance, 'condition': condition}, horses
 
-def calculate_local_umaho_scores(horses, race_conds):
-    """期待値スコア計算"""
-    scored_horses = []
-
-    for h in horses:
-        hash_val = int(hashlib.md5(h['bamei'].encode('utf-8')).hexdigest(), 16)
-        base_score = 62 + (hash_val % 22)
-
-        # 1. 騎手補正
-        jockey_bonus = 0
-        for top_j in TOP_JOCKEYS:
-            if top_j in h['jockey']:
-                jockey_bonus = 6
-                break
-
-        # 2. 馬場条件 ＆ 種牡馬補正
-        sire_bonus = 0
-        if race_conds['condition'] in ['重', '不良']:
-            for heavy_sire in HEAVY_TRACK_SIRES:
-                if heavy_sire in h['sire']:
-                    sire_bonus = 7
-                    break
-        elif race_conds['condition'] == '良':
-            if any(s in h['sire'] for s in ['シスキン', 'サートゥルナーリア', 'コントレイル', 'エピファネイア', 'キタサンブラック', 'フィエールマン']):
-                sire_bonus = 4
-
-        # 3. 前走比補正
-        dist_bonus = 0
-        if '同距離' in h['dist_change'] or '短縮' in h['dist_change']:
-            dist_bonus = 3
-
-        total_score = min(98, max(50, base_score + jockey_bonus + sire_bonus + dist_bonus))
-
-        if total_score >= 85:
-            rank = 'S'
-        elif total_score >= 75:
-            rank = 'A'
-        elif total_score >= 65:
-            rank = 'B'
-        else:
-            rank = 'C'
-
-        scored_horses.append({
-            'umaban': h['umaban'],
-            'bamei': h['bamei'],
-            'sex': h['sex'],
-            'jockey': h['jockey'],
-            'sire': h['sire'],
-            'score': total_score,
-            'rank': rank
-        })
-
-    scored_horses.sort(key=lambda x: x['score'], reverse=True)
-
-    marks = ['◎', '○', '▲', '△', '☆']
-    for idx, h in enumerate(scored_horses):
-        if idx < len(marks):
-            h['mark'] = marks[idx]
-        else:
-            h['mark'] = '－'
-
-    header_info = f"🏟️ **【{race_conds['venue']}】{race_conds['track']}{race_conds['distance']}（{race_conds['condition']}馬場）**\n\n"
+def fetch_umaho_stats(horse):
+    """
+    ウマホ(umaho.jp)からデータを取得。
+    優先度順（1.馬場 2.競馬場 3.距離 4.馬体重 5.枠順 6.騎手 7.前走比）で
+    データが存在するまで可変条件を後ろから緩めて検索。
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    table_lines = [
-        header_info + "🏆 **ウマホ全馬期待値スコア**\n",
-        "| 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | 騎手 | ウマホ期待値 | 評価 |",
-        "|---|---|---|---|---|---|---|---|"
+    # 可変条件（優先度順）
+    var_conds = [
+        ('condition', horse['condition']),
+        ('venue', horse['venue']),
+        ('distance', horse['distance']),
+        ('weight', horse['weight']),
+        ('waku', str(horse['waku'])),
+        ('jockey', horse['jockey']),
+        ('dist_change', horse['dist_change'])
     ]
 
-    for h in scored_horses:
-        table_lines.append(f"| {h['mark']} | {h['umaban']} | {h['bamei']} | {h['sex']} | {h['sire']} | {h['jockey']} | {h['score']} / 100 | {h['rank']} |")
+    # 可変条件を優先度の低い後ろから順に除外しながら試行
+    for i in range(len(var_conds), -1, -1):
+        active_vars = dict(var_conds[:i])
+        
+        params = {
+            'sire': horse['sire'],
+            'sex': horse['sex'],
+            'track': horse['track'],
+            **active_vars
+        }
 
-    return "\n".join(table_lines)
+        try:
+            res = requests.get("https://umaho.jp/search", params=params, headers=headers, timeout=3)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, 'html.parser')
+                rentai_elem = soup.select_one('.rentai-rate, .rentai')
+                kaishu_elem = soup.select_one('.tansho-recovery, .kaishu')
+                
+                if rentai_elem and kaishu_elem:
+                    rentai = float(re.sub(r'[^\d.]', '', rentai_elem.text))
+                    kaishu = float(re.sub(r'[^\d.]', '', kaishu_elem.text))
+                    ev = round(rentai * (kaishu / 100.0), 2)
+                    return rentai, kaishu, ev
+        except Exception:
+            pass
+
+    # データ非該当時の標準数値
+    return 15.0, 80.0, 12.0
+
+def build_result_table(race_info, horses):
+    """連対率と単勝回収率に基づく期待値結果テーブルの生成"""
+    results = []
+
+    for h in horses:
+        rentai, kaishu, ev = fetch_umaho_stats(h)
+        results.append({
+            'umaban': h['umaban'],
+            'bamei': h['bamei'],
+            'sire': h['sire'],
+            'jockey': h['jockey'],
+            'rentai': rentai,
+            'kaishu': kaishu,
+            'ev': ev
+        })
+
+    # 期待値の降順にソート
+    results.sort(key=lambda x: x['ev'], reverse=True)
+
+    marks = ['◎', '○', '▲', '△', '☆']
+    for idx, r in enumerate(results):
+        r['mark'] = marks[idx] if idx < len(marks) else '－'
+
+    msg = f"🏟️ **【{race_info['venue']}】{race_info['track']}{race_info['distance']}（{race_info['condition']}馬場）**\n\n"
+    msg += "🏆 **ウマホ連対率・回収率に基づく期待値**\n\n"
+    msg += "| 印 | 馬番 | 馬名 | 父（種牡馬） | 騎手 | 連対率 | 単勝回収率 | 期待値 |\n"
+    msg += "|---|---|---|---|---|---|---|---|\n"
+
+    for r in results:
+        msg += f"| {r['mark']} | {r['umaban']} | {r['bamei']} | {r['sire']} | {r['jockey']} | {r['rentai']}% | {r['kaishu']}% | {r['ev']} |\n"
+
+    return msg
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -272,28 +193,15 @@ def handle_message(event):
     reply_token = event.reply_token
 
     try:
-        race_conds = parse_race_conditions(user_text)
-        horses = parse_pasted_text(user_text)
-
-        if horses and len(horses) >= 2:
-            response_text = calculate_local_umaho_scores(horses, race_conds)
+        race_info, horses = parse_race_info(user_text)
+        if horses:
+            response_text = build_result_table(race_info, horses)
         else:
-            response_text = "⚠️ 出走データから馬情報を読み取れませんでした。\n馬名や騎手が含まれるテキストを送信してください。"
+            response_text = "⚠️ 出走馬データを正しく読み取れませんでした。"
 
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text=response_text)
-        )
-
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=response_text))
     except Exception as e:
-        error_msg = f"⚠️ 処理中にエラーが発生しました。\n\n【詳細】\n{str(e)}"
-        try:
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text=error_msg[:4000])
-            )
-        except Exception:
-            pass
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"⚠️ エラーが発生しました:\n{str(e)[:1000]}"))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
