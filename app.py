@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
@@ -85,36 +86,39 @@ def parse_race_info(user_text):
                 'venue': venue,
                 'distance': distance,
                 'weight': "500kg以上" if weight >= 500 else "500kg未満",
-                'waku': waku,
+                'waku': str(waku),
                 'jockey': jockey,
                 'dist_change': dist_change
             })
 
     return {'venue': venue, 'track': track, 'distance': distance, 'condition': condition}, horses
 
-def fetch_umaho_stats(horse):
+def fetch_umaho_stats_realtime(horse):
     """
-    ウマホ(umaho.jp)からデータを取得。
-    優先度順（1.馬場 2.競馬場 3.距離 4.馬体重 5.枠順 6.騎手 7.前走比）で
-    データが存在するまで可変条件を後ろから緩めて検索。
+    ウマホ(umaho.jp)からリアルタイム検索。
+    件数が5件未満の場合は、優先度順の低い可変条件から1つずつ外して再検索する。
     """
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
-    # 可変条件（優先度順）
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    }
+
+    # 可変条件（優先度順：高 → 低）
+    # 1.馬場 2.競馬場 3.距離 4.馬体重 5.枠順 6.騎手 7.前走比
     var_conds = [
         ('condition', horse['condition']),
         ('venue', horse['venue']),
         ('distance', horse['distance']),
         ('weight', horse['weight']),
-        ('waku', str(horse['waku'])),
+        ('waku', horse['waku']),
         ('jockey', horse['jockey']),
         ('dist_change', horse['dist_change'])
     ]
 
-    # 可変条件を優先度の低い後ろから順に除外しながら試行
+    # 可変条件を末尾（優先度の低い条件）から順に除外して試行
     for i in range(len(var_conds), -1, -1):
         active_vars = dict(var_conds[:i])
-        
+
+        # 【確定条件】＋適用中の【可変条件】
         params = {
             'sire': horse['sire'],
             'sex': horse['sex'],
@@ -123,29 +127,51 @@ def fetch_umaho_stats(horse):
         }
 
         try:
-            res = requests.get("https://umaho.jp/search", params=params, headers=headers, timeout=3)
+            url = "https://umaho.jp/search"
+            res = requests.get(url, params=params, headers=headers, timeout=5)
+            
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
-                rentai_elem = soup.select_one('.rentai-rate, .rentai')
-                kaishu_elem = soup.select_one('.tansho-recovery, .kaishu')
                 
+                # 件数の取得（例: "出走件数: 12件" や 要素から抽出）
+                count_elem = soup.select_one('.sample-count, .count, .total-count')
+                count = 0
+                if count_elem:
+                    count_match = re.search(r'(\d+)', count_elem.text)
+                    if count_match:
+                        count = int(count_match.group(1))
+
+                rentai_elem = soup.select_one('.rentai-rate, .rentai, td.rentai')
+                kaishu_elem = soup.select_one('.tansho-recovery, .kaishu, td.kaishu')
+
                 if rentai_elem and kaishu_elem:
-                    rentai = float(re.sub(r'[^\d.]', '', rentai_elem.text))
-                    kaishu = float(re.sub(r'[^\d.]', '', kaishu_elem.text))
-                    ev = round(rentai * (kaishu / 100.0), 2)
-                    return rentai, kaishu, ev
+                    rentai_str = re.sub(r'[^\d.]', '', rentai_elem.text)
+                    kaishu_str = re.sub(r'[^\d.]', '', kaishu_elem.text)
+
+                    if rentai_str and kaishu_str:
+                        rentai = float(rentai_str)
+                        kaishu = float(kaishu_str)
+
+                        # 件数要素が見つからないか、5件以上の場合は採用
+                        if count >= 5 or count_elem is None:
+                            ev = round(rentai * (kaishu / 100.0), 2)
+                            return rentai, kaishu, ev
+
         except Exception:
             pass
+        
+        # 連続アクセスの負荷軽減
+        time.sleep(0.2)
 
-    # データ非該当時の標準数値
-    return 15.0, 80.0, 12.0
+    # 検索がすべて不一致だった場合の初期値（データなし）
+    return 0.0, 0.0, 0.0
 
 def build_result_table(race_info, horses):
     """連対率と単勝回収率に基づく期待値結果テーブルの生成"""
     results = []
 
     for h in horses:
-        rentai, kaishu, ev = fetch_umaho_stats(h)
+        rentai, kaishu, ev = fetch_umaho_stats_realtime(h)
         results.append({
             'umaban': h['umaban'],
             'bamei': h['bamei'],
