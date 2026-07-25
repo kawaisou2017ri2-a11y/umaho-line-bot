@@ -1,12 +1,12 @@
 import os
 import re
 import asyncio
-import aiohttp
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from curl_cffi.requests import AsyncSession
 
 app = Flask(__name__)
 
@@ -16,8 +16,8 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# サーバーブロックを防ぐための同時リクエスト制限（最大3並列）
-SEMAPHORE = asyncio.Semaphore(3)
+# アクセス遮断を防ぐための同時リクエスト数制限（最大2並列）
+SEMAPHORE = asyncio.Semaphore(2)
 
 def parse_race_info(user_text):
     """レース基本情報と各馬のデータを抽出"""
@@ -97,7 +97,7 @@ def parse_race_info(user_text):
     return {'venue': venue, 'track': track, 'distance': distance, 'condition': condition}, horses
 
 def extract_metrics_from_html(html_text):
-    """HTMLから「件数」「連対率」「単勝回収率」を抽出"""
+    """HTMLテキストから「件数」「連対率」「単勝回収率」を抽出"""
     soup = BeautifulSoup(html_text, 'html.parser')
     text = soup.get_text(separator=' ')
 
@@ -119,13 +119,7 @@ def extract_metrics_from_html(html_text):
     return count, rentai, kaishu
 
 async def fetch_single_horse(session, horse):
-    """1頭分のデータを条件緩和バックトラック付きで取得"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Referer': 'https://umaho.jp/'
-    }
-
+    """1頭分のデータをChrome偽装通信＋条件緩和バックトラック付きで取得"""
     var_conds = [
         ('condition', horse['condition']),
         ('venue', horse['venue']),
@@ -149,26 +143,31 @@ async def fetch_single_horse(session, horse):
             }
 
             try:
-                async with session.get("https://umaho.jp/search", params=params, headers=headers, timeout=4.0) as res:
-                    last_status = res.status
-                    if res.status == 200:
-                        html_text = await res.text()
-                        count, rentai, kaishu = extract_metrics_from_html(html_text)
+                # curl_cffi により Chrome 120 のTLS/ブラウザ通信を完全模倣
+                res = await session.get(
+                    "https://umaho.jp/search",
+                    params=params,
+                    timeout=5.0
+                )
+                last_status = res.status_code
 
-                        if rentai is not None and kaishu is not None:
-                            if count >= 5:
-                                ev = round(rentai * (kaishu / 100.0), 2)
-                                return rentai, kaishu, ev, 200
+                if res.status_code == 200:
+                    count, rentai, kaishu = extract_metrics_from_html(res.text)
+
+                    if rentai is not None and kaishu is not None:
+                        if count >= 5:
+                            ev = round(rentai * (kaishu / 100.0), 2)
+                            return rentai, kaishu, ev, 200
             except Exception:
                 pass
-            
-            await asyncio.sleep(0.1)
+
+            await asyncio.sleep(0.2)
 
     return 0.0, 0.0, 0.0, last_status
 
 async def fetch_all_horses(horses):
-    """全頭のデータを非同期取得"""
-    async with aiohttp.ClientSession() as session:
+    """全頭のデータをChrome偽装AsyncSessionで一括取得"""
+    async with AsyncSession(impersonate="chrome120") as session:
         tasks = [fetch_single_horse(session, h) for h in horses]
         return await asyncio.gather(*tasks)
 
@@ -179,10 +178,9 @@ def build_result_table(race_info, horses):
     stats_list = loop.run_until_complete(fetch_all_horses(horses))
     loop.close()
 
-    # エラーチェック (403等のステータスコード検知)
     blocked_count = sum(1 for item in stats_list if item[3] in [403, 429])
     if blocked_count > 0:
-        return f"⚠️ **ウマホからのアクセスが拒否されました (HTTP {stats_list[0][3]})**\n\nウマホ側で自動検索が制限されている可能性があります。"
+        return f"⚠️ **ウマホからのアクセスが拒否されました (HTTP {stats_list[0][3]})**\n\nCloudflare/WAF制限が適用されています。"
 
     results = []
     zero_count = 0
@@ -200,7 +198,7 @@ def build_result_table(race_info, horses):
         })
 
     if zero_count == len(horses):
-        return "⚠️ **ウマホからデータを抽出できませんでした**\n\n検索URLの構造またはパラメータ名の確認が必要です。"
+        return "⚠️ **ウマホからデータを抽出できませんでした**\n\n検索URLパラメータまたはテキスト解析規則の確認が必要です。"
 
     results.sort(key=lambda x: x['ev'], reverse=True)
 
