@@ -3,6 +3,7 @@ import re
 import hashlib
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -58,8 +59,30 @@ def clean_text(text):
     text = re.sub(r'(の?(データベース|競走馬データ|掲示板|血統|オッズ|戦績|情報|プロフィール|写真))+$', '', text)
     return text.strip()
 
+def fetch_sire_backup(horse):
+    """万が一レースページで種牡馬が取れなかった場合のバックアップ取得"""
+    if horse['sire'] != '不明' or not horse.get('horse_id'):
+        return horse
+
+    try:
+        url = f"https://db.sp.netkeiba.com/horse/{horse['horse_id']}"
+        res = requests.get(url, headers=HEADERS, timeout=2.5)
+        res.encoding = 'utf-8'
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        sire_tag = soup.select_one('table.BloodTable a, .Blood_Table a, a[href*="/horse/pedigree/"]')
+        if sire_tag:
+            raw_sire = clean_text(sire_tag.text)
+            sire_m = re.search(r'[\u30A1-\u30FC]{2,9}', raw_sire)
+            if sire_m and sire_m.group(0) != horse['bamei']:
+                horse['sire'] = sire_m.group(0)
+    except Exception:
+        pass
+
+    return horse
+
 def parse_netkeiba(raw_url):
-    """スマホ版(100% UTF-8)から文字化けなしで馬名・性齢・騎手・父馬を完全取得"""
+    """馬名の直上・周囲にある種牡馬（シスキン、サートゥルナーリア等）を正確に抽出"""
     try:
         race_id_match = re.search(r'(\d{10,12})', raw_url)
         if not race_id_match:
@@ -67,7 +90,6 @@ def parse_netkeiba(raw_url):
 
         race_id = race_id_match.group(1)
 
-        # UTF-8で安定してデータが取得できるスマホ版URL
         target_urls = [
             f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}",
             f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
@@ -78,8 +100,8 @@ def parse_netkeiba(raw_url):
 
         for target_url in target_urls:
             try:
-                res = requests.get(target_url, headers=HEADERS, timeout=6)
-                res.encoding = 'utf-8'  # 強制UTF-8指定で文字化けを完全防止
+                res = requests.get(target_url, headers=HEADERS, timeout=5)
+                res.encoding = 'utf-8'
                 soup = BeautifulSoup(res.text, 'html.parser')
 
                 title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum, .Race_Title')
@@ -95,7 +117,6 @@ def parse_netkeiba(raw_url):
 
                 for a_tag in horse_links:
                     raw_text = clean_text(a_tag.text)
-                    # カタカナ2〜9文字のみを厳格抽出
                     kana_match = re.search(r'[\u30A1-\u30FC]{2,9}', raw_text)
                     if not kana_match:
                         continue
@@ -104,8 +125,13 @@ def parse_netkeiba(raw_url):
                     if bamei in seen_bamei or bamei in ['データベース', '掲示板', '血統', 'オッズ', '出走表', 'ニュース', '写真']:
                         continue
 
-                    # 馬1頭分の親ブロックを取得
-                    row_block = a_tag.find_parent(['tr', 'li', 'div', 'dd'])
+                    # 馬IDの取得
+                    href = a_tag.get('href', '')
+                    id_m = re.search(r'/horse/(\d{10,12})', href)
+                    horse_id = id_m.group(1) if id_m else None
+
+                    # 馬1頭分の要素ブロックを取得
+                    row_block = a_tag.find_parent(['tr', 'li', 'dd', 'div'])
                     if not row_block:
                         row_block = a_tag.parent.parent
 
@@ -133,27 +159,33 @@ def parse_netkeiba(raw_url):
                         if jockey_elem:
                             jockey = clean_text(jockey_elem.text)
 
-                    # 4. 父（種牡馬）
+                    # 4. 種牡馬（父）の抽出：馬名の「上」や「周囲」の血統表示要素を解析
                     sire = "不明"
-                    sire_a = row_block.find('a', href=re.compile(r'/(sire|pedigree|directory/sire)/', re.I))
-                    if sire_a:
-                        sire_raw = clean_text(sire_a.text)
-                        sire_m = re.search(r'[\u30A1-\u30FC]{2,9}', sire_raw)
-                        if sire_m and sire_m.group(0) != bamei:
-                            sire = sire_m.group(0)
+                    
+                    # (a) 専用クラス名（Sire, Blood, Father 等）から抽出
+                    sire_elem = row_block.select_one('.Sire, .sire, .SireName, .sire_name, .Blood, .blood, .Father, .father, [class*="Sire"], [class*="sire"]')
+                    if sire_elem:
+                        sm = re.search(r'[\u30A1-\u30FC]{2,9}', clean_text(sire_elem.text))
+                        if sm and sm.group(0) != bamei:
+                            sire = sm.group(0)
 
+                    # (b) 血統リンク（/pedigree/ や /directory/sire/）から抽出
                     if sire == "不明":
-                        sire_elem = row_block.select_one('.Sire, .sire, .SireName, .sire_name, .Blood, .blood, .Father, .father')
-                        if sire_elem:
-                            sire_m = re.search(r'[\u30A1-\u30FC]{2,9}', sire_elem.text)
-                            if sire_m and sire_m.group(0) != bamei:
-                                sire = sire_m.group(0)
+                        sire_a = row_block.find('a', href=re.compile(r'/(sire|pedigree|directory/sire)/', re.I))
+                        if sire_a:
+                            sm = re.search(r'[\u30A1-\u30FC]{2,9}', clean_text(sire_a.text))
+                            if sm and sm.group(0) != bamei:
+                                sire = sm.group(0)
 
+                    # (c) 馬名リンクの前後の兄弟タグ（直上テキスト等）から抽出
                     if sire == "不明":
-                        m_sire = re.search(r'父[：:\s]*([\u30A1-\u30FC]{2,9})', row_block.text)
-                        if m_sire:
-                            sire = m_sire.group(1)
+                        prev_sibling = a_tag.find_previous_sibling()
+                        if prev_sibling:
+                            sm = re.search(r'[\u30A1-\u30FC]{2,9}', clean_text(prev_sibling.text))
+                            if sm and sm.group(0) != bamei and sm.group(0) != jockey:
+                                sire = sm.group(0)
 
+                    # (d) ブロック内の別カタカナ文字列（父馬名）から判定
                     if sire == "不明":
                         all_a = row_block.find_all('a')
                         for lk in all_a:
@@ -167,6 +199,7 @@ def parse_netkeiba(raw_url):
 
                     seen_bamei.add(bamei)
                     temp_horses.append({
+                        'horse_id': horse_id,
                         'umaban': int(umaban) if umaban.isdigit() and int(umaban) > 0 else len(temp_horses) + 1,
                         'bamei': bamei,
                         'sex': sex,
@@ -175,8 +208,11 @@ def parse_netkeiba(raw_url):
                     })
 
                 if len(temp_horses) >= 3:
-                    horses = temp_horses
+                    # まだ「不明」の馬があれば高速バックアップ並列通信を実行
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        horses = list(executor.map(fetch_sire_backup, temp_horses))
                     break
+
             except Exception:
                 continue
 
@@ -186,7 +222,7 @@ def parse_netkeiba(raw_url):
         return None, []
 
 def calculate_local_umaho_scores(horses, track_condition):
-    """【API不要】ローカルロジックでウマホ期待値を高速・決定論的に算出"""
+    """【種牡馬データ連動】ウマホ期待値を高精度に算出"""
     scored_horses = []
 
     for h in horses:
@@ -200,7 +236,7 @@ def calculate_local_umaho_scores(horses, track_condition):
                 jockey_bonus = 6
                 break
 
-        # 2. 馬場条件 ＆ 種牡馬補正
+        # 2. 馬場条件 ＆ 種牡馬補正（重馬場適性血統チェック）
         sire_bonus = 0
         if track_condition in ['重', '不良']:
             for heavy_sire in HEAVY_TRACK_SIRES:
