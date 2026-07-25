@@ -1,7 +1,7 @@
 import os
 import re
-import time
-import requests
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -93,17 +93,12 @@ def parse_race_info(user_text):
 
     return {'venue': venue, 'track': track, 'distance': distance, 'condition': condition}, horses
 
-def fetch_umaho_stats_realtime(horse):
-    """
-    ウマホ(umaho.jp)からリアルタイム検索。
-    件数が5件未満の場合は、優先度順の低い可変条件から1つずつ外して再検索する。
-    """
+async def fetch_single_horse(session, horse):
+    """1頭分のデータを非同期でウマホから取得（5件未満時は条件自動緩和）"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
     }
 
-    # 可変条件（優先度順：高 → 低）
-    # 1.馬場 2.競馬場 3.距離 4.馬体重 5.枠順 6.騎手 7.前走比
     var_conds = [
         ('condition', horse['condition']),
         ('venue', horse['venue']),
@@ -114,11 +109,8 @@ def fetch_umaho_stats_realtime(horse):
         ('dist_change', horse['dist_change'])
     ]
 
-    # 可変条件を末尾（優先度の低い条件）から順に除外して試行
     for i in range(len(var_conds), -1, -1):
         active_vars = dict(var_conds[:i])
-
-        # 【確定条件】＋適用中の【可変条件】
         params = {
             'sire': horse['sire'],
             'sex': horse['sex'],
@@ -127,51 +119,51 @@ def fetch_umaho_stats_realtime(horse):
         }
 
         try:
-            url = "https://umaho.jp/search"
-            res = requests.get(url, params=params, headers=headers, timeout=5)
-            
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                
-                # 件数の取得（例: "出走件数: 12件" や 要素から抽出）
-                count_elem = soup.select_one('.sample-count, .count, .total-count')
-                count = 0
-                if count_elem:
-                    count_match = re.search(r'(\d+)', count_elem.text)
-                    if count_match:
-                        count = int(count_match.group(1))
+            async with session.get("https://umaho.jp/search", params=params, headers=headers, timeout=2.0) as res:
+                if res.status == 200:
+                    text = await res.text()
+                    soup = BeautifulSoup(text, 'html.parser')
 
-                rentai_elem = soup.select_one('.rentai-rate, .rentai, td.rentai')
-                kaishu_elem = soup.select_one('.tansho-recovery, .kaishu, td.kaishu')
+                    count_elem = soup.select_one('.sample-count, .count, .total-count')
+                    count = 0
+                    if count_elem:
+                        m = re.search(r'(\d+)', count_elem.text)
+                        if m: count = int(m.group(1))
 
-                if rentai_elem and kaishu_elem:
-                    rentai_str = re.sub(r'[^\d.]', '', rentai_elem.text)
-                    kaishu_str = re.sub(r'[^\d.]', '', kaishu_elem.text)
+                    rentai_elem = soup.select_one('.rentai-rate, .rentai, td.rentai')
+                    kaishu_elem = soup.select_one('.tansho-recovery, .kaishu, td.kaishu')
 
-                    if rentai_str and kaishu_str:
-                        rentai = float(rentai_str)
-                        kaishu = float(kaishu_str)
+                    if rentai_elem and kaishu_elem:
+                        r_str = re.sub(r'[^\d.]', '', rentai_elem.text)
+                        k_str = re.sub(r'[^\d.]', '', kaishu_elem.text)
 
-                        # 件数要素が見つからないか、5件以上の場合は採用
-                        if count >= 5 or count_elem is None:
-                            ev = round(rentai * (kaishu / 100.0), 2)
-                            return rentai, kaishu, ev
+                        if r_str and k_str:
+                            rentai = float(r_str)
+                            kaishu = float(k_str)
 
+                            if count >= 5 or count_elem is None:
+                                ev = round(rentai * (kaishu / 100.0), 2)
+                                return rentai, kaishu, ev
         except Exception:
             pass
-        
-        # 連続アクセスの負荷軽減
-        time.sleep(0.2)
 
-    # 検索がすべて不一致だった場合の初期値（データなし）
     return 0.0, 0.0, 0.0
 
-def build_result_table(race_info, horses):
-    """連対率と単勝回収率に基づく期待値結果テーブルの生成"""
-    results = []
+async def fetch_all_horses(horses):
+    """全頭を一括非同期並列取得"""
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_single_horse(session, h) for h in horses]
+        return await asyncio.gather(*tasks)
 
-    for h in horses:
-        rentai, kaishu, ev = fetch_umaho_stats_realtime(h)
+def build_result_table(race_info, horses):
+    """結果テーブル生成"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    stats_list = loop.run_until_complete(fetch_all_horses(horses))
+    loop.close()
+
+    results = []
+    for h, (rentai, kaishu, ev) in zip(horses, stats_list):
         results.append({
             'umaban': h['umaban'],
             'bamei': h['bamei'],
@@ -182,7 +174,6 @@ def build_result_table(race_info, horses):
             'ev': ev
         })
 
-    # 期待値の降順にソート
     results.sort(key=lambda x: x['ev'], reverse=True)
 
     marks = ['◎', '○', '▲', '△', '☆']
