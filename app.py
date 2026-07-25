@@ -16,6 +16,9 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# サーバーブロックを防ぐための同時リクエスト制限（最大3並列）
+SEMAPHORE = asyncio.Semaphore(3)
+
 def parse_race_info(user_text):
     """レース基本情報と各馬のデータを抽出"""
     lines = [l.strip() for l in user_text.strip().splitlines() if l.strip()]
@@ -94,25 +97,20 @@ def parse_race_info(user_text):
     return {'venue': venue, 'track': track, 'distance': distance, 'condition': condition}, horses
 
 def extract_metrics_from_html(html_text):
-    """
-    HTMLテキスト全体から「件数」「連対率」「単勝回収率」の数値を柔軟に抽出する
-    """
+    """HTMLから「件数」「連対率」「単勝回収率」を抽出"""
     soup = BeautifulSoup(html_text, 'html.parser')
     text = soup.get_text(separator=' ')
 
-    # 1. 件数の抽出 (例: "12件", "該当数: 15", "サンプル 8")
-    count = 999  # 件数表示がない場合は制限なしとみなす
+    count = 999
     count_match = re.search(r'(?:件数|該当|件|データ|サンプル)[^\d]*(\d+)', text)
     if count_match:
         count = int(count_match.group(1))
 
-    # 2. 連対率の抽出 (例: "連対率 25.4%", "連対率: 18.0")
     rentai = None
     rentai_match = re.search(r'連対率[^\d]*(\d+(?:\.\d+)?)%?', text)
     if rentai_match:
         rentai = float(rentai_match.group(1))
 
-    # 3. 単勝回収率の抽出 (例: "単勝回収率 120%", "回収率: 85")
     kaishu = None
     kaishu_match = re.search(r'(?:単勝)?回収率[^\d]*(\d+(?:\.\d+)?)%?', text)
     if kaishu_match:
@@ -123,12 +121,11 @@ def extract_metrics_from_html(html_text):
 async def fetch_single_horse(session, horse):
     """1頭分のデータを条件緩和バックトラック付きで取得"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'
+        'Referer': 'https://umaho.jp/'
     }
 
-    # 可変条件（優先度順: 1.馬場 2.競馬場 3.距離 4.馬体重 5.枠順 6.騎手 7.前走比）
     var_conds = [
         ('condition', horse['condition']),
         ('venue', horse['venue']),
@@ -139,49 +136,59 @@ async def fetch_single_horse(session, horse):
         ('dist_change', horse['dist_change'])
     ]
 
-    # 優先度の低い可変条件から順に外して再試行
-    for i in range(len(var_conds), -1, -1):
-        active_vars = dict(var_conds[:i])
-        params = {
-            'sire': horse['sire'],
-            'sex': horse['sex'],
-            'track': horse['track'],
-            **active_vars
-        }
+    last_status = 200
 
-        try:
-            async with session.get("https://umaho.jp/search", params=params, headers=headers, timeout=2.5) as res:
-                if res.status == 200:
-                    html_text = await res.text()
-                    count, rentai, kaishu = extract_metrics_from_html(html_text)
+    async with SEMAPHORE:
+        for i in range(len(var_conds), -1, -1):
+            active_vars = dict(var_conds[:i])
+            params = {
+                'sire': horse['sire'],
+                'sex': horse['sex'],
+                'track': horse['track'],
+                **active_vars
+            }
 
-                    if rentai is not None and kaishu is not None:
-                        # 件数が5件以上あれば採用（件数判定不能な場合も数値が取れていれば採用）
-                        if count >= 5:
-                            ev = round(rentai * (kaishu / 100.0), 2)
-                            return rentai, kaishu, ev
-                else:
-                    print(f"HTTP Error {res.status} for {horse['bamei']}")
-        except Exception as e:
-            print(f"Fetch Error for {horse['bamei']}: {e}")
+            try:
+                async with session.get("https://umaho.jp/search", params=params, headers=headers, timeout=4.0) as res:
+                    last_status = res.status
+                    if res.status == 200:
+                        html_text = await res.text()
+                        count, rentai, kaishu = extract_metrics_from_html(html_text)
 
-    return 0.0, 0.0, 0.0
+                        if rentai is not None and kaishu is not None:
+                            if count >= 5:
+                                ev = round(rentai * (kaishu / 100.0), 2)
+                                return rentai, kaishu, ev, 200
+            except Exception:
+                pass
+            
+            await asyncio.sleep(0.1)
+
+    return 0.0, 0.0, 0.0, last_status
 
 async def fetch_all_horses(horses):
-    """全頭を一括非同期並列取得"""
+    """全頭のデータを非同期取得"""
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_single_horse(session, h) for h in horses]
         return await asyncio.gather(*tasks)
 
 def build_result_table(race_info, horses):
-    """結果テーブル生成"""
+    """結果テーブルまたはエラーメッセージの生成"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     stats_list = loop.run_until_complete(fetch_all_horses(horses))
     loop.close()
 
+    # エラーチェック (403等のステータスコード検知)
+    blocked_count = sum(1 for item in stats_list if item[3] in [403, 429])
+    if blocked_count > 0:
+        return f"⚠️ **ウマホからのアクセスが拒否されました (HTTP {stats_list[0][3]})**\n\nウマホ側で自動検索が制限されている可能性があります。"
+
     results = []
-    for h, (rentai, kaishu, ev) in zip(horses, stats_list):
+    zero_count = 0
+    for h, (rentai, kaishu, ev, status) in zip(horses, stats_list):
+        if ev == 0.0:
+            zero_count += 1
         results.append({
             'umaban': h['umaban'],
             'bamei': h['bamei'],
@@ -192,7 +199,9 @@ def build_result_table(race_info, horses):
             'ev': ev
         })
 
-    # 期待値順に並び替え
+    if zero_count == len(horses):
+        return "⚠️ **ウマホからデータを抽出できませんでした**\n\n検索URLの構造またはパラメータ名の確認が必要です。"
+
     results.sort(key=lambda x: x['ev'], reverse=True)
 
     marks = ['◎', '○', '▲', '△', '☆']
