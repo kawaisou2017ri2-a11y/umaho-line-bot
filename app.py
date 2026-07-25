@@ -39,30 +39,34 @@ def parse_race_conditions(text):
         'condition': '良'
     }
     
+    # 本文中の誤判定を防ぐため、1行目（ヘッダー）のみを対象に条件抽出
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    header = lines[0] if lines else text
+
     # 競馬場
     venues = ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']
     for v in venues:
-        if v in text:
+        if v in header:
             conds['venue'] = v
             break
 
-    # トラック
-    if 'ダート' in text or 'ダ' in text:
+    # トラック判定
+    if 'ダート' in header or ('ダ' in header and '芝' not in header):
         conds['track'] = 'ダート'
-    elif '芝' in text:
+    elif '芝' in header:
         conds['track'] = '芝'
 
     # 距離
-    dist_m = re.search(r'(\d{4})m?', text)
+    dist_m = re.search(r'(\d{3,4})m?', header)
     if dist_m:
         conds['distance'] = f"{dist_m.group(1)}m"
 
     # 馬場状態
-    if '不良' in text:
+    if '不良' in header:
         conds['condition'] = '不良'
-    elif '稍重' in text:
+    elif '稍重' in header:
         conds['condition'] = '稍重'
-    elif '重' in text:
+    elif '重' in header:
         conds['condition'] = '重'
     else:
         conds['condition'] = '良'
@@ -73,11 +77,9 @@ def parse_pasted_text(raw_text):
     """複数行（キー:値形式）および1行形式の両方に対応する高精度パース"""
     horses = []
     
-    # 空行または馬番の区切りでブロック分割
     blocks = re.split(r'\n\s*\n', raw_text.strip())
     
     if len(blocks) <= 1:
-        # 数字 + 空白 + 馬名の行パターンで分割を試みる
         raw_blocks = re.split(r'(?=\n\d{1,2}\s+[\u30A1-\u30FC]{2,9})', raw_text)
         if len(raw_blocks) > 1:
             blocks = raw_blocks
@@ -89,7 +91,7 @@ def parse_pasted_text(raw_text):
 
         lines = [l.strip() for l in block_text.splitlines() if l.strip()]
         
-        # ヘッダー行（例：「札幌芝2000m良馬場」）のスキップ
+        # ヘッダー行のスキップ
         if any(v in lines[0] for v in ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']) and ('芝' in lines[0] or 'ダ' in lines[0] or 'm' in lines[0]):
             continue
 
@@ -101,9 +103,8 @@ def parse_pasted_text(raw_text):
         jockey = "不明"
         dist_change = "不明"
 
-        # ブロック内の各行を解析
         for line in lines:
-            # 1. 馬番と馬名 (例: "1 デルマタカチホ" または "1. デルマタカチホ")
+            # 1. 馬番と馬名
             m_horse = re.search(r'^(\d{1,2})[\s\.\:]+([\u30A1-\u30FC]{2,9})', line)
             if m_horse:
                 umaban = int(m_horse.group(1))
@@ -145,7 +146,7 @@ def parse_pasted_text(raw_text):
                     dist_change = m_dist.group(1)
                 continue
 
-        # フォールバック処理（1行まとめ形式の場合）
+        # フォールバック処理
         if bamei == "不明":
             for line in lines:
                 m_inline = re.search(r'(\d{1,2})\s+([\u30A1-\u30FC]{2,9})', line)
