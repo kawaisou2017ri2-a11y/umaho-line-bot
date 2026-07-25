@@ -23,9 +23,16 @@ HEADERS = {
 }
 
 # 重馬場・道悪で評価が上がる血統リスト
-HEAVY_TRACK_SIRES = ['キズナ', 'エピファネイア', 'ドゥラメンテ', 'オルフェーヴル', 'ゴールドシップ', 'ハービンジャー', 'モーリス', 'キタサンブラック', 'ルーラーシップ', 'フィエールマン', 'サートゥルナーリア']
+HEAVY_TRACK_SIRES = [
+    'キズナ', 'エピファネイア', 'ドゥラメンテ', 'オルフェーヴル', 'ゴールドシップ', 
+    'ハービンジャー', 'モーリス', 'キタサンブラック', 'ルーラーシップ', 'フィエールマン', 
+    'サートゥルナーリア', 'サトノダイヤモンド', 'シスキン'
+]
 # トップ騎手リスト
-TOP_JOCKEYS = ['ルメール', '川田', '武豊', '横山武', '戸崎', '坂井', 'レーン', 'モレイラ', 'デムーロ', '鮫島駿', '丹内', '長浜', '舟山']
+TOP_JOCKEYS = [
+    'ルメール', '川田', '武豊', '横山武', '戸崎', '坂井', 'レーン', 
+    'モレイラ', 'デムーロ', '鮫島駿', '丹内', '長浜', '舟山', '河原田'
+]
 
 def extract_url(text):
     """テキストからURLを抽出"""
@@ -45,18 +52,26 @@ def extract_track_condition(text):
     return '良'
 
 def clean_horse_name(name):
-    """馬名に含まれる余計な文字列を除去"""
-    name = re.sub(r'の(データベース|競走馬データ|掲示板|血統|オッズ|戦績)$', '', name)
-    name = re.sub(r'[\r\n\t]', '', name)
+    """馬名に含まれる改行・空白・余計なデータベース文字列を徹底洗浄"""
+    if not name:
+        return ""
+    # 1. 改行・タブ・連続スペースの除去
+    name = re.sub(r'[\r\n\t]+', '', name)
+    name = name.strip()
+    # 2. 末尾の不要ワード（のデータベース、の競走馬データ、データベース等）を除去
+    name = re.sub(r'(の?(データベース|競走馬データ|掲示板|血統|オッズ|戦績|情報|プロフィール|写真))+$', '', name)
     return name.strip()
 
 def backup_horse_search(horse_name):
-    """【バックアップ機能】馬名からNetkeiba DBを直接検索して「父（種牡馬）」と「性齢」を取得"""
+    """【高速バックアップ】馬名からNetkeiba DBを検索し、父（種牡馬）と性齢を取得"""
     try:
         clean_name = clean_horse_name(horse_name)
+        if not clean_name or len(clean_name) < 2:
+            return "不明", "不明"
+
         encoded_name = urllib.parse.quote(clean_name.encode('euc-jp', errors='ignore'))
         search_url = f"https://db.netkeiba.com/?pid=horse_list&word={encoded_name}"
-        res = requests.get(search_url, headers=HEADERS, timeout=4)
+        res = requests.get(search_url, headers=HEADERS, timeout=3)
         res.encoding = 'euc-jp'
         soup = BeautifulSoup(res.text, 'html.parser')
         
@@ -68,28 +83,21 @@ def backup_horse_search(horse_name):
             rows = horse_table.select('tr')
             if len(rows) > 1:
                 cols = rows[1].select('td')
-                if len(cols) > 1:
-                    # 性齢取得（3列目想定）
-                    if len(cols) > 2:
-                        sex = cols[2].text.strip()
-
-                    detail_link = cols[1].find('a')['href']
-                    detail_res = requests.get(f"https://db.netkeiba.com{detail_link}", headers=HEADERS, timeout=4)
-                    detail_res.encoding = 'euc-jp'
-                    detail_soup = BeautifulSoup(detail_res.text, 'html.parser')
-                    
-                    blood_table = detail_soup.select_one('table.blood_table')
-                    if blood_table:
-                        sire_elem = blood_table.select_one('td[rowspan]')
-                        if sire_elem and sire_elem.find('a'):
-                            sire = sire_elem.find('a').text.strip()
+                # 通常: cols[1]=馬名, cols[2]=性齢, cols[3]=父
+                if len(cols) >= 4:
+                    sex_text = cols[2].text.strip()
+                    sire_text = cols[3].text.strip()
+                    if sex_text:
+                        sex = sex_text
+                    if sire_text:
+                        sire = sire_text
         return sire, sex
     except Exception:
         pass
     return "不明", "不明"
 
 def parse_netkeiba(raw_url):
-    """NetkeibaのURLから race_id を特定し、出走馬データを抽出"""
+    """NetkeibaのURLから race_id を特定し、出走馬データを完全解析"""
     try:
         race_id_match = re.search(r'race_id=(\d{10,12})', raw_url)
         if not race_id_match:
@@ -101,8 +109,8 @@ def parse_netkeiba(raw_url):
         race_id = race_id_match.group(1)
 
         candidate_urls = [
-            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
-            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}"
+            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}",
+            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
         ]
 
         horses = []
@@ -123,13 +131,17 @@ def parse_netkeiba(raw_url):
                 temp_horses = []
 
                 for a_tag in horse_links:
-                    raw_bamei = a_tag.text.strip()
+                    raw_bamei = a_tag.text
                     bamei = clean_horse_name(raw_bamei)
 
+                    # 無効な名称や重複馬のスキップ
                     if not bamei or len(bamei) < 2 or bamei in ['写真', '掲示板', '血統', '映像', '出走表', 'オッズ', 'ニュース', 'データベース']:
                         continue
                     if bamei in seen_bamei:
                         continue
+
+                    # 重複防止セットに即時追加
+                    seen_bamei.add(bamei)
 
                     row_block = a_tag.find_parent(['tr', 'li', 'div', 'dd'])
                     
@@ -161,7 +173,7 @@ def parse_netkeiba(raw_url):
                         if sire_elem:
                             sire = sire_elem.text.strip()
 
-                    # 父または性齢が未取得の場合、自動補完データベース検索を実行
+                    # 父または性齢が未取得の場合、高速バックアップ検索を実行
                     if not sire or sire == "不明" or len(sire) < 2 or sex == "不明":
                         db_sire, db_sex = backup_horse_search(bamei)
                         if not sire or sire == "不明":
@@ -169,7 +181,6 @@ def parse_netkeiba(raw_url):
                         if sex == "不明":
                             sex = db_sex
 
-                    seen_bamei.add(bamei)
                     temp_horses.append({
                         'umaban': int(umaban) if umaban.isdigit() and int(umaban) > 0 else len(temp_horses) + 1,
                         'bamei': bamei,
@@ -194,7 +205,7 @@ def calculate_local_umaho_scores(horses, track_condition):
     scored_horses = []
 
     for h in horses:
-        # 正しい馬名でハッシュ生成
+        # 洗浄済み馬名で基本スコア（能力ハッシュ）を生成
         hash_val = int(hashlib.md5(h['bamei'].encode('utf-8')).hexdigest(), 16)
         base_score = 60 + (hash_val % 26)
 
