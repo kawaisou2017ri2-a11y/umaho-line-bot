@@ -19,97 +19,171 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 HEAVY_TRACK_SIRES = [
     'キズナ', 'エピファネイア', 'ドゥラメンテ', 'オルフェーヴル', 'ゴールドシップ', 
     'ハービンジャー', 'モーリス', 'キタサンブラック', 'ルーラーシップ', 'フィエールマン', 
-    'サートゥルナーリア', 'サトノダイヤモンド', 'シスキン', 'ジャングルポケット', 'ディープインパクト'
+    'サートゥルナーリア', 'サトノダイヤモンド', 'シスキン', 'ジャングルポケット', 'ディープインパクト',
+    'コントレイル'
 ]
 
 # トップ騎手リスト
 TOP_JOCKEYS = [
-    'ルメール', '川田', '武豊', '横山武', '戸崎', '坂井', 'レーン', 
-    'モレイラ', 'デムーロ', '鮫島駿', '丹内', '長浜', '舟山', '河原田', '高杉'
+    'ルメール', '川田', '武豊', '横山武', '横山和', '戸崎', '坂井', 'レーン', 
+    'モレイラ', 'デムーロ', '鮫島克', '鮫島駿', '丹内', '長浜', '舟山', '河原田', '高杉',
+    '西村淳', '佐々木', '浜中', '松本', '古川奈', '小林美'
 ]
 
-def extract_track_condition(text):
-    """テキスト内から馬場状態（良・稍重・重・不良）を自動判定"""
+def parse_race_conditions(text):
+    """レース全体条件（競馬場・トラック・距離・馬場状態）を抽出"""
+    conds = {
+        'venue': '不明',
+        'track': '芝',
+        'distance': '2000m',
+        'condition': '良'
+    }
+    
+    # 競馬場
+    venues = ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']
+    for v in venues:
+        if v in text:
+            conds['venue'] = v
+            break
+
+    # トラック
+    if 'ダート' in text or 'ダ' in text:
+        conds['track'] = 'ダート'
+    elif '芝' in text:
+        conds['track'] = '芝'
+
+    # 距離
+    dist_m = re.search(r'(\d{4})m?', text)
+    if dist_m:
+        conds['distance'] = f"{dist_m.group(1)}m"
+
+    # 馬場状態
     if '不良' in text:
-        return '不良'
+        conds['condition'] = '不良'
     elif '稍重' in text:
-        return '稍重'
+        conds['condition'] = '稍重'
     elif '重' in text:
-        return '重'
-    return '良'
+        conds['condition'] = '重'
+    else:
+        conds['condition'] = '良'
+
+    return conds
 
 def parse_pasted_text(raw_text):
-    """コピペされた出走表テキストから馬情報を高精度抽出"""
-    lines = raw_text.splitlines()
+    """複数行（キー:値形式）および1行形式の両方に対応する高精度パース"""
     horses = []
-    seen_bamei = set()
+    
+    # 空行または馬番の区切りでブロック分割
+    blocks = re.split(r'\n\s*\n', raw_text.strip())
+    
+    if len(blocks) <= 1:
+        # 数字 + 空白 + 馬名の行パターンで分割を試みる
+        raw_blocks = re.split(r'(?=\n\d{1,2}\s+[\u30A1-\u30FC]{2,9})', raw_text)
+        if len(raw_blocks) > 1:
+            blocks = raw_blocks
 
-    for line in lines:
-        line_str = line.strip()
-        if not line_str:
+    for block in blocks:
+        block_text = block.strip()
+        if not block_text:
             continue
 
-        # カタカナ単語（2文字以上）をすべて抽出
-        kana_words = re.findall(r'[\u30A1-\u30FC]{2,9}', line_str)
-        if not kana_words:
+        lines = [l.strip() for l in block_text.splitlines() if l.strip()]
+        
+        # ヘッダー行（例：「札幌芝2000m良馬場」）のスキップ
+        if any(v in lines[0] for v in ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉']) and ('芝' in lines[0] or 'ダ' in lines[0] or 'm' in lines[0]):
             continue
 
-        # 除外キーワード
-        invalid_words = ['データベース', '掲示板', '血統', 'オッズ', '出走表', 'ニュース', '写真', '調教', '予想', 'タイム', 'パドック']
-        kana_words = [w for w in kana_words if w not in invalid_words]
-
-        if not kana_words:
-            continue
-
-        # 馬名の特定（最初に見つかったカタカナ）
-        bamei = kana_words[0]
-        if bamei in seen_bamei:
-            continue
-
-        # 馬番の取得（行頭付近の数字）
-        umaban_m = re.search(r'^\s*(\d{1,2})\b', line_str)
-        if not umaban_m:
-            umaban_m = re.search(r'\b(\d{1,2})\b', line_str)
-        umaban = int(umaban_m.group(1)) if umaban_m else (len(horses) + 1)
-
-        # 性齢の取得 (例: 牡3, 牝4, セ5)
-        sex_m = re.search(r'([牡牝セ]\d{1,2})', line_str)
-        sex = sex_m.group(1) if sex_m else "不明"
-
-        # 騎手・父（種牡馬）の特定
-        jockey = "不明"
+        bamei = "不明"
+        umaban = 0
         sire = "不明"
+        sex = "不明"
+        waku = 0
+        jockey = "不明"
+        dist_change = "不明"
 
-        # 2番目以降のカタカナ単語から騎手と父馬を割り当て
-        for word in kana_words[1:]:
-            # 騎手判定
-            if jockey == "不明" and any(j in word for j in TOP_JOCKEYS + ['丹内', '横山', '川田', 'ルメール', '武', '戸崎', '坂井']):
-                jockey = word
+        # ブロック内の各行を解析
+        for line in lines:
+            # 1. 馬番と馬名 (例: "1 デルマタカチホ" または "1. デルマタカチホ")
+            m_horse = re.search(r'^(\d{1,2})[\s\.\:]+([\u30A1-\u30FC]{2,9})', line)
+            if m_horse:
+                umaban = int(m_horse.group(1))
+                bamei = m_horse.group(2)
                 continue
-            
-            # 父（種牡馬）判定（馬名でも騎手でもないカタカナ）
-            if sire == "不明" and word != bamei and word != jockey:
-                sire = word
 
-        seen_bamei.add(bamei)
-        horses.append({
-            'umaban': umaban,
-            'bamei': bamei,
-            'sex': sex,
-            'jockey': jockey,
-            'sire': sire
-        })
+            # 2. 種牡馬
+            if '種牡馬' in line or '父' in line:
+                m_sire = re.search(r'(?:種牡馬|父)[\s\:\：]*([\u30A1-\u30FCa-zA-Z0-9\s]{2,15})', line)
+                if m_sire:
+                    sire = m_sire.group(1).strip()
+                continue
+
+            # 3. 性別 / 性齢
+            if '性別' in line or '性齢' in line or re.search(r'[牡牝セ]\d', line):
+                m_sex = re.search(r'([牡牝セ]\d{1,2}|[牡牝セ])', line)
+                if m_sex:
+                    sex = m_sex.group(1)
+                continue
+
+            # 4. 枠
+            if '枠' in line:
+                m_waku = re.search(r'枠[\s\:\：]*(\d{1,2})', line)
+                if m_waku:
+                    waku = int(m_waku.group(1))
+                continue
+
+            # 5. 騎手
+            if '騎手' in line:
+                m_jockey = re.search(r'騎手[\s\:\：]*([^\s]+)', line)
+                if m_jockey:
+                    jockey = m_jockey.group(1)
+                continue
+
+            # 6. 前走比
+            if '前走比' in line or '距離' in line:
+                m_dist = re.search(r'(前走比[\s\:\：]*[^\n]+|距離(?:延長|短縮|同距離)[^\n]*)', line)
+                if m_dist:
+                    dist_change = m_dist.group(1)
+                continue
+
+        # フォールバック処理（1行まとめ形式の場合）
+        if bamei == "不明":
+            for line in lines:
+                m_inline = re.search(r'(\d{1,2})\s+([\u30A1-\u30FC]{2,9})', line)
+                if m_inline:
+                    umaban = int(m_inline.group(1))
+                    bamei = m_inline.group(2)
+                    
+                    m_sex_inline = re.search(r'([牡牝セ]\d{1,2})', line)
+                    if m_sex_inline:
+                        sex = m_sex_inline.group(1)
+                        
+                    kana_words = re.findall(r'[\u30A1-\u30FC]{2,9}', line)
+                    invalid_words = ['データベース', '掲示板', '血統', 'オッズ', '出走表', 'ニュース', '写真', '調教', '予想']
+                    kana_words = [w for w in kana_words if w not in invalid_words and w != bamei]
+                    if kana_words:
+                        sire = kana_words[0]
+
+        if bamei != "不明":
+            horses.append({
+                'umaban': umaban if umaban > 0 else len(horses) + 1,
+                'bamei': bamei,
+                'sire': sire,
+                'sex': sex,
+                'waku': waku if waku > 0 else (umaban // 2 + 1 if umaban > 0 else 0),
+                'jockey': jockey,
+                'dist_change': dist_change
+            })
 
     horses.sort(key=lambda x: x['umaban'])
     return horses
 
-def calculate_local_umaho_scores(horses, track_condition):
+def calculate_local_umaho_scores(horses, race_conds):
     """期待値スコア計算"""
     scored_horses = []
 
     for h in horses:
         hash_val = int(hashlib.md5(h['bamei'].encode('utf-8')).hexdigest(), 16)
-        base_score = 60 + (hash_val % 26)
+        base_score = 62 + (hash_val % 22)
 
         # 1. 騎手補正
         jockey_bonus = 0
@@ -120,13 +194,21 @@ def calculate_local_umaho_scores(horses, track_condition):
 
         # 2. 馬場条件 ＆ 種牡馬補正
         sire_bonus = 0
-        if track_condition in ['重', '不良']:
+        if race_conds['condition'] in ['重', '不良']:
             for heavy_sire in HEAVY_TRACK_SIRES:
                 if heavy_sire in h['sire']:
-                    sire_bonus = 8
+                    sire_bonus = 7
                     break
+        elif race_conds['condition'] == '良':
+            if any(s in h['sire'] for s in ['シスキン', 'サートゥルナーリア', 'コントレイル', 'エピファネイア', 'キタサンブラック', 'フィエールマン']):
+                sire_bonus = 4
 
-        total_score = min(98, max(50, base_score + jockey_bonus + sire_bonus))
+        # 3. 前走比補正
+        dist_bonus = 0
+        if '同距離' in h['dist_change'] or '短縮' in h['dist_change']:
+            dist_bonus = 3
+
+        total_score = min(98, max(50, base_score + jockey_bonus + sire_bonus + dist_bonus))
 
         if total_score >= 85:
             rank = 'S'
@@ -141,6 +223,7 @@ def calculate_local_umaho_scores(horses, track_condition):
             'umaban': h['umaban'],
             'bamei': h['bamei'],
             'sex': h['sex'],
+            'jockey': h['jockey'],
             'sire': h['sire'],
             'score': total_score,
             'rank': rank
@@ -155,14 +238,16 @@ def calculate_local_umaho_scores(horses, track_condition):
         else:
             h['mark'] = '－'
 
+    header_info = f"🏟️ **【{race_conds['venue']}】{race_conds['track']}{race_conds['distance']}（{race_conds['condition']}馬場）**\n\n"
+    
     table_lines = [
-        "🏆 **ウマホ全馬期待値スコア**\n",
-        "| 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | ウマホ期待値 | 評価 |",
-        "|---|---|---|---|---|---|---|"
+        header_info + "🏆 **ウマホ全馬期待値スコア**\n",
+        "| 印 | 馬番 | 馬名 | 性齢 | 父（種牡馬） | 騎手 | ウマホ期待値 | 評価 |",
+        "|---|---|---|---|---|---|---|---|"
     ]
 
     for h in scored_horses:
-        table_lines.append(f"| {h['mark']} | {h['umaban']} | {h['bamei']} | {h['sex']} | {h['sire']} | {h['score']} / 100 | {h['rank']} |")
+        table_lines.append(f"| {h['mark']} | {h['umaban']} | {h['bamei']} | {h['sex']} | {h['sire']} | {h['jockey']} | {h['score']} / 100 | {h['rank']} |")
 
     return "\n".join(table_lines)
 
@@ -186,13 +271,13 @@ def handle_message(event):
     reply_token = event.reply_token
 
     try:
-        track_condition = extract_track_condition(user_text)
+        race_conds = parse_race_conditions(user_text)
         horses = parse_pasted_text(user_text)
 
         if horses and len(horses) >= 2:
-            response_text = calculate_local_umaho_scores(horses, track_condition)
+            response_text = calculate_local_umaho_scores(horses, race_conds)
         else:
-            response_text = "⚠️ 出走表テキストから馬情報を読み取れませんでした。\nNetkeibaなどの出走表テキストをコピーして貼り付けて送信してください。"
+            response_text = "⚠️ 出走データから馬情報を読み取れませんでした。\n馬名や騎手が含まれるテキストを送信してください。"
 
         line_bot_api.reply_message(
             reply_token,
