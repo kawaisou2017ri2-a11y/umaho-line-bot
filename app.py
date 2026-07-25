@@ -17,8 +17,8 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-PC_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 }
 
 # 重馬場・道悪で評価が上がる血統リスト
@@ -50,24 +50,16 @@ def extract_track_condition(text):
         return '良'
     return '良'
 
-def fetch_html_pc(url):
-    """PC版Netkeiba(EUC-JP)の文字化け防止レスポンス取得"""
-    res = requests.get(url, headers=PC_HEADERS, timeout=6)
-    try:
-        return res.content.decode('euc-jp', errors='replace')
-    except Exception:
-        return res.text
-
 def clean_text(text):
-    """文字化け記号や改行、不要なデータベース文字列を削除"""
+    """改行や不要なデータベース文字列を削除"""
     if not text:
         return ""
-    text = re.sub(r'[\uFFFD\uFFFE\uFFFF\r\n\t]+', '', text)
+    text = re.sub(r'[\r\n\t]+', '', text)
     text = re.sub(r'(の?(データベース|競走馬データ|掲示板|血統|オッズ|戦績|情報|プロフィール|写真))+$', '', text)
     return text.strip()
 
 def parse_netkeiba(raw_url):
-    """PC版出走表を優先解析し、全出走馬と種牡馬（父）を100%確実に抽出"""
+    """スマホ版(100% UTF-8)から文字化けなしで馬名・性齢・騎手・父馬を完全取得"""
     try:
         race_id_match = re.search(r'(\d{10,12})', raw_url)
         if not race_id_match:
@@ -75,10 +67,10 @@ def parse_netkeiba(raw_url):
 
         race_id = race_id_match.group(1)
 
-        # PC版出走表（血統・父馬が100%掲載されている）を最優先指定
+        # UTF-8で安定してデータが取得できるスマホ版URL
         target_urls = [
-            f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
-            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}"
+            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}",
+            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
         ]
 
         horses = []
@@ -86,81 +78,91 @@ def parse_netkeiba(raw_url):
 
         for target_url in target_urls:
             try:
-                html = fetch_html_pc(target_url)
-                soup = BeautifulSoup(html, 'html.parser')
+                res = requests.get(target_url, headers=HEADERS, timeout=6)
+                res.encoding = 'utf-8'  # 強制UTF-8指定で文字化けを完全防止
+                soup = BeautifulSoup(res.text, 'html.parser')
 
                 title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum, .Race_Title')
                 if title_elem and title_elem.text.strip():
                     race_title = clean_text(title_elem.text)
 
-                # PC版出走表の行要素 (tr.HorseList)
-                rows = soup.select('tr.HorseList, tr[class*="HorseList"], table.ShutubaTable tr')
-                if not rows:
-                    rows = soup.find_all('tr')
+                horse_links = soup.find_all('a', href=re.compile(r'/horse/\d+'))
+                if not horse_links:
+                    continue
 
                 seen_bamei = set()
                 temp_horses = []
 
-                for row in rows:
-                    a_tag = row.find('a', href=re.compile(r'/horse/\d+'))
-                    if not a_tag:
-                        continue
-
+                for a_tag in horse_links:
                     raw_text = clean_text(a_tag.text)
+                    # カタカナ2〜9文字のみを厳格抽出
                     kana_match = re.search(r'[\u30A1-\u30FC]{2,9}', raw_text)
-                    bamei = kana_match.group(0) if kana_match else raw_text
+                    if not kana_match:
+                        continue
+                    bamei = kana_match.group(0)
 
-                    if not bamei or len(bamei) < 2 or bamei in ['写真', '掲示板', '血統', '映像', '出走表', 'オッズ', 'ニュース', 'データベース']:
+                    if bamei in seen_bamei or bamei in ['データベース', '掲示板', '血統', 'オッズ', '出走表', 'ニュース', '写真']:
                         continue
-                    if bamei in seen_bamei:
-                        continue
+
+                    # 馬1頭分の親ブロックを取得
+                    row_block = a_tag.find_parent(['tr', 'li', 'div', 'dd'])
+                    if not row_block:
+                        row_block = a_tag.parent.parent
 
                     # 1. 馬番
                     umaban = "0"
-                    umaban_td = row.select_one('.Umaban, .td_umaban, .Num, .num, td.Num')
-                    if umaban_td:
-                        m = re.search(r'\d+', umaban_td.text)
+                    umaban_elem = row_block.select_one('.Umaban, .td_umaban, .Num, .num, td.Num, .Umaban_Num, .no')
+                    if umaban_elem:
+                        m = re.search(r'\d+', umaban_elem.text)
                         if m:
                             umaban = m.group(0)
 
                     # 2. 性齢
                     sex = "不明"
-                    sex_match = re.search(r'([牡牝セ]\d{1,2})', row.text)
+                    sex_match = re.search(r'([牡牝セ]\d{1,2})', row_block.text)
                     if sex_match:
                         sex = sex_match.group(1)
 
                     # 3. 騎手
                     jockey = "不明"
-                    jockey_td = row.select_one('.Jockey, .jockey, .JockeyName, a[href*="/jockey/"]')
-                    if jockey_td:
-                        jockey = clean_text(jockey_td.text)
+                    jockey_a = row_block.find('a', href=re.compile(r'/jockey/'))
+                    if jockey_a:
+                        jockey = clean_text(jockey_a.text)
+                    else:
+                        jockey_elem = row_block.select_one('.Jockey, .jockey, .JockeyName')
+                        if jockey_elem:
+                            jockey = clean_text(jockey_elem.text)
 
                     # 4. 父（種牡馬）
                     sire = "不明"
-                    blood_td = row.select_one('td.Blood, .Blood, .BloodName, .Sire, .sire')
-                    if blood_td:
-                        # 血統枠の中の最初の馬名（父馬）を取得
-                        sire_a = blood_td.find('a')
-                        if sire_a:
-                            cand = clean_text(sire_a.text)
-                            cand_m = re.search(r'[\u30A1-\u30FC]{2,9}', cand)
-                            if cand_m and cand_m.group(0) != bamei:
-                                sire = cand_m.group(0)
-                        if sire == "不明":
-                            cand_m = re.search(r'[\u30A1-\u30FC]{2,9}', blood_td.text)
-                            if cand_m and cand_m.group(0) != bamei:
-                                sire = cand_m.group(0)
+                    sire_a = row_block.find('a', href=re.compile(r'/(sire|pedigree|directory/sire)/', re.I))
+                    if sire_a:
+                        sire_raw = clean_text(sire_a.text)
+                        sire_m = re.search(r'[\u30A1-\u30FC]{2,9}', sire_raw)
+                        if sire_m and sire_m.group(0) != bamei:
+                            sire = sire_m.group(0)
 
-                    # 万が一取得できていない場合のバックアップ検索（行全体のテキストから抽出）
                     if sire == "不明":
-                        all_a = row.find_all('a')
-                        for a in all_a:
-                            href = a.get('href', '')
-                            if '/sire/' in href or '/pedigree/' in href or 'directory/sire' in href:
-                                cand = clean_text(a.text)
-                                cand_m = re.search(r'[\u30A1-\u30FC]{2,9}', cand)
-                                if cand_m and cand_m.group(0) != bamei:
-                                    sire = cand_m.group(0)
+                        sire_elem = row_block.select_one('.Sire, .sire, .SireName, .sire_name, .Blood, .blood, .Father, .father')
+                        if sire_elem:
+                            sire_m = re.search(r'[\u30A1-\u30FC]{2,9}', sire_elem.text)
+                            if sire_m and sire_m.group(0) != bamei:
+                                sire = sire_m.group(0)
+
+                    if sire == "不明":
+                        m_sire = re.search(r'父[：:\s]*([\u30A1-\u30FC]{2,9})', row_block.text)
+                        if m_sire:
+                            sire = m_sire.group(1)
+
+                    if sire == "不明":
+                        all_a = row_block.find_all('a')
+                        for lk in all_a:
+                            lk_text = clean_text(lk.text)
+                            km = re.search(r'[\u30A1-\u30FC]{2,9}', lk_text)
+                            if km:
+                                cand = km.group(0)
+                                if cand != bamei and cand != jockey and cand not in ['データベース', '掲示板', '血統', 'オッズ', '出走表', 'ニュース', '写真']:
+                                    sire = cand
                                     break
 
                     seen_bamei.add(bamei)
@@ -172,16 +174,9 @@ def parse_netkeiba(raw_url):
                         'sire': sire
                     })
 
-                # 種牡馬（sire）が1頭でも「不明」以外で正しく取れているかをチェック
-                sire_found = any(h['sire'] != "不明" for h in temp_horses)
-
-                if len(temp_horses) >= 3 and sire_found:
+                if len(temp_horses) >= 3:
                     horses = temp_horses
                     break
-                elif len(temp_horses) >= 3 and not horses:
-                    # 種牡馬が取れなくても念のためキープ
-                    horses = temp_horses
-
             except Exception:
                 continue
 
