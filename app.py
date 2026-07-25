@@ -17,10 +17,7 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-PC_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
-SP_HEADERS = {
+HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 }
 
@@ -53,16 +50,28 @@ def extract_track_condition(text):
         return '良'
     return '良'
 
+def fetch_html_safe(url):
+    """EUC-JP と UTF-8 の両方に対応する文字化け防止HTML取得関数"""
+    res = requests.get(url, headers=HEADERS, timeout=6)
+    try:
+        html = res.content.decode('euc-jp')
+    except (UnicodeDecodeError, TypeError):
+        try:
+            html = res.content.decode('utf-8')
+        except (UnicodeDecodeError, TypeError):
+            html = res.content.decode('euc-jp', errors='ignore')
+    return html
+
 def clean_text(text):
-    """改行や余計なデータベース文字列を削除"""
+    """文字化け記号や改行、不要なデータベース文字列を削除"""
     if not text:
         return ""
-    text = re.sub(r'[\r\n\t]+', '', text)
+    text = re.sub(r'[\uFFFD\uFFFE\uFFFF\r\n\t]+', '', text)
     text = re.sub(r'(の?(データベース|競走馬データ|掲示板|血統|オッズ|戦績|情報|プロフィール|写真))+$', '', text)
     return text.strip()
 
 def parse_netkeiba(raw_url):
-    """全出走馬のデータを確実に100%抽出する万能パース処理"""
+    """全出走馬のデータを文字化けなしで確実に抽出"""
     try:
         race_id_match = re.search(r'(\d{10,12})', raw_url)
         if not race_id_match:
@@ -71,20 +80,17 @@ def parse_netkeiba(raw_url):
         race_id = race_id_match.group(1)
 
         candidate_urls = [
-            (f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}", "pc"),
-            (f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}", "sp"),
-            (f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}", "sp")
+            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
+            f"https://race.sp.netkeiba.com/race/newspaper.html?race_id={race_id}"
         ]
 
         horses = []
         race_title = "レース"
 
-        for target_url, mode in candidate_urls:
+        for target_url in candidate_urls:
             try:
-                headers = PC_HEADERS if mode == "pc" else SP_HEADERS
-                res = requests.get(target_url, headers=headers, timeout=5)
-                res.encoding = 'euc-jp' if mode == "pc" else (res.apparent_encoding or 'utf-8')
-                soup = BeautifulSoup(res.text, 'html.parser')
+                html = fetch_html_safe(target_url)
+                soup = BeautifulSoup(html, 'html.parser')
 
                 title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum, .Race_Title')
                 if title_elem and title_elem.text.strip():
@@ -98,73 +104,50 @@ def parse_netkeiba(raw_url):
                 temp_horses = []
 
                 for a_tag in horse_links:
-                    raw_bamei = a_tag.text
-                    bamei = clean_text(raw_bamei)
+                    raw_text = clean_text(a_tag.text)
+                    
+                    # 馬名（カタカナ2〜9文字）を抽出
+                    kana_match = re.search(r'[\u30A1-\u30FC]{2,9}', raw_text)
+                    if kana_match:
+                        bamei = kana_match.group(0)
+                    else:
+                        bamei = raw_text
 
                     if not bamei or len(bamei) < 2 or bamei in ['写真', '掲示板', '血統', '映像', '出走表', 'オッズ', 'ニュース', 'データベース']:
                         continue
                     if bamei in seen_bamei:
                         continue
 
-                    # 各馬単体の親要素ブロックを動的に検出（全体枠を掴まない処理）
-                    curr = a_tag
-                    horse_container = a_tag.parent
-                    while horse_container and horse_container.name not in ['body', 'html', '[document]']:
-                        links_in_container = horse_container.find_all('a', href=re.compile(r'/horse/\d+'))
-                        if len(links_in_container) > 2:
-                            horse_container = curr
-                            break
-                        curr = horse_container
-                        horse_container = horse_container.parent
+                    # 馬の行ブロックを取得
+                    row_block = a_tag.find_parent(['tr', 'li', 'div', 'dd'])
 
-                    if not horse_container:
-                        horse_container = a_tag.parent.parent
-
-                    # 1. 馬番
                     umaban = "0"
-                    umaban_elem = horse_container.select_one('.Umaban, .td_umaban, .Num, .num, td.Num, .Umaban_Num, .no')
-                    if umaban_elem:
-                        m = re.search(r'\d+', umaban_elem.text)
-                        if m:
-                            umaban = m.group(0)
-                    if umaban == "0":
-                        m = re.search(r'^\s*(\d{1,2})\b', horse_container.text)
-                        if m:
-                            umaban = m.group(1)
-
-                    # 2. 性齢
                     sex = "不明"
-                    sex_elem = horse_container.select_one('.Barei, .sex_age, .Sex, .Age, .Barei_Sex')
-                    if sex_elem:
-                        sex = clean_text(sex_elem.text)
-                    if sex == "不明":
-                        m_sex = re.search(r'([牡牝セ]\d{1,2})', horse_container.text)
-                        if m_sex:
-                            sex = m_sex.group(1)
-
-                    # 3. 騎手
                     jockey = "不明"
-                    jockey_tag = horse_container.find('a', href=re.compile(r'/jockey/'))
-                    if jockey_tag:
-                        jockey = clean_text(jockey_tag.text)
-                    if jockey == "不明":
-                        jockey_elem = horse_container.select_one('.Jockey, .jockey, .JockeyName')
+                    sire = "不明"
+
+                    if row_block:
+                        # 馬番
+                        umaban_elem = row_block.select_one('.Umaban, .td_umaban, .Num, .num, td.Num, .Umaban_Num, .no')
+                        if umaban_elem:
+                            m = re.search(r'\d+', umaban_elem.text)
+                            if m:
+                                umaban = m.group(0)
+
+                        # 性齢（牡3, 牝4 などを正規表現で抽出）
+                        sex_match = re.search(r'([牡牝セ]\d{1,2})', row_block.text)
+                        if sex_match:
+                            sex = sex_match.group(1)
+
+                        # 騎手
+                        jockey_elem = row_block.select_one('.Jockey, .jockey, .JockeyName, a[href*="/jockey/"]')
                         if jockey_elem:
                             jockey = clean_text(jockey_elem.text)
 
-                    # 4. 父（種牡馬）
-                    sire = "不明"
-                    sire_tag = horse_container.find('a', href=re.compile(r'/(sire|pedigree)/'))
-                    if sire_tag:
-                        sire = clean_text(sire_tag.text)
-                    if sire == "不明":
-                        sire_elem = horse_container.select_one('.Sire, .sire, .SireName, .Blood')
+                        # 父（種牡馬）
+                        sire_elem = row_block.select_one('.Sire, .sire, .SireName, a[href*="/sire/"], a[href*="/pedigree/"]')
                         if sire_elem:
                             sire = clean_text(sire_elem.text)
-                    if sire == "不明":
-                        m_sire = re.search(r'父[：:\s]*([一-龥ァ-ヴー]+)', horse_container.text)
-                        if m_sire:
-                            sire = m_sire.group(1)
 
                     seen_bamei.add(bamei)
                     temp_horses.append({
@@ -175,7 +158,6 @@ def parse_netkeiba(raw_url):
                         'sire': sire
                     })
 
-                # 出走馬が3頭以上取得できたら成功として抜ける
                 if len(temp_horses) >= 3:
                     horses = temp_horses
                     break
