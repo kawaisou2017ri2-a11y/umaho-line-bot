@@ -93,12 +93,42 @@ def parse_race_info(user_text):
 
     return {'venue': venue, 'track': track, 'distance': distance, 'condition': condition}, horses
 
+def extract_metrics_from_html(html_text):
+    """
+    HTMLテキスト全体から「件数」「連対率」「単勝回収率」の数値を柔軟に抽出する
+    """
+    soup = BeautifulSoup(html_text, 'html.parser')
+    text = soup.get_text(separator=' ')
+
+    # 1. 件数の抽出 (例: "12件", "該当数: 15", "サンプル 8")
+    count = 999  # 件数表示がない場合は制限なしとみなす
+    count_match = re.search(r'(?:件数|該当|件|データ|サンプル)[^\d]*(\d+)', text)
+    if count_match:
+        count = int(count_match.group(1))
+
+    # 2. 連対率の抽出 (例: "連対率 25.4%", "連対率: 18.0")
+    rentai = None
+    rentai_match = re.search(r'連対率[^\d]*(\d+(?:\.\d+)?)%?', text)
+    if rentai_match:
+        rentai = float(rentai_match.group(1))
+
+    # 3. 単勝回収率の抽出 (例: "単勝回収率 120%", "回収率: 85")
+    kaishu = None
+    kaishu_match = re.search(r'(?:単勝)?回収率[^\d]*(\d+(?:\.\d+)?)%?', text)
+    if kaishu_match:
+        kaishu = float(kaishu_match.group(1))
+
+    return count, rentai, kaishu
+
 async def fetch_single_horse(session, horse):
-    """1頭分のデータを非同期でウマホから取得（5件未満時は条件自動緩和）"""
+    """1頭分のデータを条件緩和バックトラック付きで取得"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'
     }
 
+    # 可変条件（優先度順: 1.馬場 2.競馬場 3.距離 4.馬体重 5.枠順 6.騎手 7.前走比）
     var_conds = [
         ('condition', horse['condition']),
         ('venue', horse['venue']),
@@ -109,6 +139,7 @@ async def fetch_single_horse(session, horse):
         ('dist_change', horse['dist_change'])
     ]
 
+    # 優先度の低い可変条件から順に外して再試行
     for i in range(len(var_conds), -1, -1):
         active_vars = dict(var_conds[:i])
         params = {
@@ -119,33 +150,20 @@ async def fetch_single_horse(session, horse):
         }
 
         try:
-            async with session.get("https://umaho.jp/search", params=params, headers=headers, timeout=2.0) as res:
+            async with session.get("https://umaho.jp/search", params=params, headers=headers, timeout=2.5) as res:
                 if res.status == 200:
-                    text = await res.text()
-                    soup = BeautifulSoup(text, 'html.parser')
+                    html_text = await res.text()
+                    count, rentai, kaishu = extract_metrics_from_html(html_text)
 
-                    count_elem = soup.select_one('.sample-count, .count, .total-count')
-                    count = 0
-                    if count_elem:
-                        m = re.search(r'(\d+)', count_elem.text)
-                        if m: count = int(m.group(1))
-
-                    rentai_elem = soup.select_one('.rentai-rate, .rentai, td.rentai')
-                    kaishu_elem = soup.select_one('.tansho-recovery, .kaishu, td.kaishu')
-
-                    if rentai_elem and kaishu_elem:
-                        r_str = re.sub(r'[^\d.]', '', rentai_elem.text)
-                        k_str = re.sub(r'[^\d.]', '', kaishu_elem.text)
-
-                        if r_str and k_str:
-                            rentai = float(r_str)
-                            kaishu = float(k_str)
-
-                            if count >= 5 or count_elem is None:
-                                ev = round(rentai * (kaishu / 100.0), 2)
-                                return rentai, kaishu, ev
-        except Exception:
-            pass
+                    if rentai is not None and kaishu is not None:
+                        # 件数が5件以上あれば採用（件数判定不能な場合も数値が取れていれば採用）
+                        if count >= 5:
+                            ev = round(rentai * (kaishu / 100.0), 2)
+                            return rentai, kaishu, ev
+                else:
+                    print(f"HTTP Error {res.status} for {horse['bamei']}")
+        except Exception as e:
+            print(f"Fetch Error for {horse['bamei']}: {e}")
 
     return 0.0, 0.0, 0.0
 
@@ -174,6 +192,7 @@ def build_result_table(race_info, horses):
             'ev': ev
         })
 
+    # 期待値順に並び替え
     results.sort(key=lambda x: x['ev'], reverse=True)
 
     marks = ['◎', '○', '▲', '△', '☆']
