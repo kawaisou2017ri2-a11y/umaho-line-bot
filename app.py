@@ -1,7 +1,6 @@
 import os
 import re
 import urllib.parse
-import threading
 import hashlib
 import requests
 from bs4 import BeautifulSoup
@@ -12,7 +11,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 環境変数の読み込み（LINE関連のみでOK）
+# 環境変数の読み込み
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 
@@ -23,9 +22,9 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
 }
 
-# 重馬場・道悪で評価が上がる血統リスト（例）
+# 重馬場・道悪で評価が上がる血統リスト
 HEAVY_TRACK_SIRES = ['キズナ', 'エピファネイア', 'ドゥラメンテ', 'オルフェーヴル', 'ゴールドシップ', 'ハービンジャー', 'モーリス', 'キタサンブラック', 'ルーラーシップ']
-# トップ騎手リスト（例）
+# トップ騎手リスト
 TOP_JOCKEYS = ['ルメール', '川田', '武豊', '横山武', '戸崎', '坂井', 'レーン', 'モレイラ', 'デムーロ', '鮫島駿']
 
 def extract_url(text):
@@ -197,44 +196,6 @@ def calculate_local_umaho_scores(horses, track_condition):
 
     return "\n".join(table_lines)
 
-def process_async_prediction(user_text, reply_token, user_id):
-    """バックグラウンド処理メイン関数"""
-    try:
-        url = extract_url(user_text)
-        track_condition = extract_track_condition(user_text)
-        
-        condition_msg = f"（馬場条件: 【{track_condition}】を反映）" if '馬場' in user_text or track_condition != '良' else ""
-
-        if url and 'netkeiba' in url:
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text=f"【受付完了】\nNetkeibaデータを解析し、ウマホ期待値を直ちに計算中... 🏇\n{condition_msg}")
-            )
-            
-            race_info, horses = parse_netkeiba(url)
-            
-            if horses:
-                response_text = calculate_local_umaho_scores(horses, track_condition)
-            else:
-                response_text = "⚠️ Netkeibaから出走馬データを取得できませんでした。URLを確認してください。"
-        else:
-            response_text = "⚠️ NetkeibaのレースURLを入力してください。"
-
-        line_bot_api.push_message(
-            user_id,
-            TextSendMessage(text=response_text)
-        )
-
-    except Exception as e:
-        error_msg = f"⚠️ 処理中にエラーが発生しました。\n\n【詳細】\n{str(e)}"
-        try:
-            line_bot_api.push_message(
-                user_id,
-                TextSendMessage(text=error_msg[:4000])
-            )
-        except Exception:
-            pass
-
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -253,13 +214,35 @@ def index():
 def handle_message(event):
     user_text = event.message.text
     reply_token = event.reply_token
-    user_id = event.source.user_id
 
-    thread = threading.Thread(
-        target=process_async_prediction,
-        args=(user_text, reply_token, user_id)
-    )
-    thread.start()
+    try:
+        url = extract_url(user_text)
+        track_condition = extract_track_condition(user_text)
+
+        if url and 'netkeiba' in url:
+            race_info, horses = parse_netkeiba(url)
+            
+            if horses:
+                response_text = calculate_local_umaho_scores(horses, track_condition)
+            else:
+                response_text = "⚠️ Netkeibaから出走馬データを取得できませんでした。\nURLが正しく出走表ページ（Shutuba）を示しているか確認してください。"
+        else:
+            response_text = "⚠️ Netkeibaの出走表URL（https://...）を送信してください。"
+
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text=response_text)
+        )
+
+    except Exception as e:
+        error_msg = f"⚠️ 処理中にエラーが発生しました。\n\n【詳細】\n{str(e)}"
+        try:
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text=error_msg[:4000])
+            )
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
