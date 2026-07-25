@@ -18,8 +18,9 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# PC版ブラウザに偽装するヘッダー（データの確実な取得のため）
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
 
 # 重馬場・道悪で評価が上がる血統リスト
@@ -43,6 +44,14 @@ def extract_track_condition(text):
     elif '良' in text:
         return '良'
     return '良'
+
+def convert_to_pc_netkeiba_url(url):
+    """スマホ版・新聞・予想などあらゆるNetkeiba URLを安定したPC版標準出走表URLに変換"""
+    race_id_match = re.search(r'race_id=(\d+)', url)
+    if race_id_match:
+        race_id = race_id_match.group(1)
+        return f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    return url
 
 def backup_horse_search(horse_name):
     """【バックアップ機能】出走表で種牡馬（父）が不明な場合、Netkeiba DBを検索して取得"""
@@ -76,37 +85,41 @@ def backup_horse_search(horse_name):
 def parse_netkeiba(url):
     """NetkeibaのURLからレース条件と全出走馬データを抽出"""
     try:
-        res = requests.get(url, headers=HEADERS, timeout=6)
-        res.encoding = res.apparent_encoding if res.apparent_encoding else 'utf-8'
+        # PC版URLへ強制変換
+        pc_url = convert_to_pc_netkeiba_url(url)
+        
+        res = requests.get(pc_url, headers=HEADERS, timeout=6)
+        res.encoding = res.apparent_encoding if res.apparent_encoding else 'euc-jp'
         soup = BeautifulSoup(res.text, 'html.parser')
         
         race_title = ""
-        title_elem = soup.select_one('.RaceName, .race_name, h1, .RaceNum')
+        title_elem = soup.select_one('.RaceName, .RaceNum')
         if title_elem:
             race_title = title_elem.text.strip()
 
         race_data = ""
-        data_elem = soup.select_one('.RaceData01, .race_data, .RaceData, .RaceItem')
+        data_elem = soup.select_one('.RaceData01')
         if data_elem:
             race_data = data_elem.text.strip()
 
         horses = []
-        rows = soup.select('tr.HorseList, tr.HorseInfo, table.Shutuba_Table tr, .HorseListTr, tr[class*="Horse"]')
+        # PC版テーブルの行を取得
+        rows = soup.select('tr.HorseList')
         if not rows:
-            rows = soup.select('.Shutuba_Table tr, table tr')
+            rows = soup.select('table.Shutuba_Table tr')
 
         for row in rows:
-            umaban_elem = row.select_one('.Umaban, .td_umaban, td.Num, .umaban')
-            bamei_elem = row.select_one('.HorseName, .Horse_Name, .bamei, a[href*="/horse/"]')
+            umaban_elem = row.select_one('td.Umaban, .td_umaban, td.Num')
+            bamei_elem = row.select_one('span.HorseName a, .HorseName, .HorseInfo a')
             
             if umaban_elem and bamei_elem:
                 umaban = umaban_elem.text.strip()
                 bamei = bamei_elem.text.strip()
                 
                 if umaban.isdigit() and bamei:
-                    sex_elem = row.select_one('.Barei, .sex_age, .Sex')
-                    jockey_elem = row.select_one('.Jockey, .jockey, .JockeyName')
-                    sire_elem = row.select_one('.Sire, .sire, .SireName')
+                    sex_elem = row.select_one('td.Barei, .Barei')
+                    jockey_elem = row.select_one('td.Jockey a, .Jockey')
+                    sire_elem = row.select_one('td.Sire, .Sire')
                     
                     sex = sex_elem.text.strip() if sex_elem else "不明"
                     jockey = jockey_elem.text.strip() if jockey_elem else "不明"
@@ -225,9 +238,9 @@ def handle_message(event):
             if horses:
                 response_text = calculate_local_umaho_scores(horses, track_condition)
             else:
-                response_text = "⚠️ Netkeibaから出走馬データを取得できませんでした。\nURLが正しく出走表ページ（Shutuba）を示しているか確認してください。"
+                response_text = "⚠️ Netkeibaから出走馬データを取得できませんでした。\nURLに race_id が含まれているか確認してください。"
         else:
-            response_text = "⚠️ Netkeibaの出走表URL（https://...）を送信してください。"
+            response_text = "⚠️ NetkeibaのレースURL（https://...）を送信してください。"
 
         line_bot_api.reply_message(
             reply_token,
